@@ -1,0 +1,828 @@
+### PRD: N3X Plataforma v1 (controller, sidecar, SDK, builder e plugin core)
+
+Versão: 1.5
+Data: 2026-10-20
+Responsável: Guilherme Giusti
+
+---
+
+### Resumo
+
+O N3X (Network Navigation Node eXtensible, pronúncia "Nex") é um middleware de rede extensível que funciona como uma camada de override sobre um proxy Envoy em modelo sidecar. Cada aplicação ganha um sidecar ao lado, que passa a ser a única porta de entrada dela, e todos os sidecars se conectam a um controller central. Os comportamentos de rede que hoje são reimplementados em cada produto passam a ser plugins, compilados juntos num único dynamic module Go carregado dentro do Envoy.
+
+Cada serviço tem a própria configuração no arquivo `n3x.yaml`, inclusive a dos plugins. O controller não altera configurações: ele observa os sidecars, mostra num painel web o inventário, a config efetiva e as divergências de cada um, e expõe um servidor gRPC cujos serviços crescem conforme os plugins são acoplados. Mudar um comportamento significa alterar o `n3x.yaml` do serviço e redeployar, sem tocar no código da aplicação.
+
+O N3X é agnóstico de linguagem e de orquestrador: roda em Kubernetes, ECS ou docker compose, bastando configurar os containers, e a mesma imagem funciona dentro de uma malha Istio, que é requisito de compatibilidade e não de funcionamento. A v1 entrega a base da plataforma: controller, sidecar, SDK de plugins, builder via Docker e o plugin core de registro. Nenhum plugin de comportamento de tráfego entra na v1 além do plugin de exemplo do SDK. O controller não tem armazenamento próprio: cada plugin que guarda dados traz o próprio banco. Na v1, o plugin core guarda inventário, configs e eventos só em memória e lê os usuários de leitura do `n3x.yaml` do controller; a auditoria fica para a v2.
+
+---
+
+### Contexto e problema
+
+Público-alvo
+- Principal: time de plataforma/SRE, que opera o controller, acompanha os sidecars pelo painel e define a config de cada serviço
+- Secundário: times de produto, que colocam o sidecar ao lado da aplicação sem alterar o código dela
+- Secundário: autores de plugins; na v1, apenas o responsável pelo projeto escreve plugins
+
+Cenários de uso chave
+- Colocar um serviço novo atrás do N3X apenas configurando os containers e o `n3x.yaml`, sem alterar o código da aplicação
+- Criar um plugin novo a partir do SDK e incluí-lo nas imagens do sidecar e do controller por meio de um Dockerfile
+- Acompanhar no painel todos os sidecars, seus plugins, a config efetiva de cada instância e as divergências entre instâncias do mesmo serviço
+- Rodar o mesmo sidecar em Kubernetes, ECS ou docker compose e, quando houver, dentro de uma malha Istio
+- Atender serviços HTTP e gRPC escritos em qualquer linguagem
+
+Onde essa feature será implantada
+- Sistema novo, distribuído em cinco repositórios no GitHub: `n3x-controller`, `n3x-sidecar`, `n3x-sdk`, `n3x-builder` e `n3x-plugin-core`, mais um repositório por plugin futuro. Roda onde houver containers: o sidecar fica ao lado da aplicação no mesmo namespace de rede (pod no Kubernetes, task no ECS, `network_mode: service` no docker compose). O Istio é requisito de compatibilidade, não de funcionamento.
+
+Problemas priorizados
+- Comportamentos de rede (rate limit, observabilidade, forward, redirects e outros) são reimplementados do zero em cada serviço e em cada plataforma. Impacto: todo produto novo esbarra nesses comportamentos e demora muito mais para ser entregue (sem números medidos; o impacto quantitativo é hipótese). Prioridade: alta
+- A lógica de rede fica acoplada ao código e à linguagem de cada aplicação. Impacto: cada linguagem exige uma implementação própria, e a solução precisa ser desacoplada por plugins e agnóstica de linguagem. Prioridade: alta
+- As alternativas já tentadas não resolvem: bibliotecas por serviço geram retrabalho por linguagem, service mesh como o Istio é pesado e exige Kubernetes, e API gateways são difíceis de estender com lógica própria ou cobrem só a borda. Impacto: custo e complexidade operacional desproporcionais ao problema. Prioridade: alta
+
+---
+
+### Objetivos e métricas
+
+| Objetivo                                                               | Métrica                                                         | Meta                      |
+| ---------------------------------------------------------------------- | --------------------------------------------------------------- | ------------------------- |
+| Acelerar a entrega de produtos novos | Tempo para colocar um serviço novo atrás do N3X, registrado e visível no painel | Até 30 minutos, sem alterar o código da aplicação |
+| Mudar comportamento sem alterar o código da aplicação | Linhas de código da aplicação alteradas para ligar, desligar ou reconfigurar um plugin | Zero, mudando só o `n3x.yaml` do sidecar e redeployando o serviço |
+| Manter a infraestrutura leve | O que é preciso para subir controller, sidecar e aplicação | Um único docker compose, sem Kubernetes, em até 5 minutos |
+| Ser agnóstico de linguagem | Resultado do mesmo plugin (plugin de exemplo do SDK) em serviços de linguagens diferentes | Mesmo comportamento em serviços HTTP e gRPC escritos em pelo menos 2 linguagens |
+
+---
+
+### Escopo
+
+Incluso
+- `n3x-sidecar`: imagem de runtime (Envoy oficial 1.40 ou proxyv2 do Istio 1.31) com entrypoint supervisor em Go, que lê o `n3x.yaml`, gera o bootstrap, ajusta o runtime Go, supervisiona o Envoy e drena no desligamento, e o core do `.so`, com o executor da cadeia de plugins, o adaptador por alvo, a conexão gRPC compartilhada com o controller e a contenção de falhas por plugin
+- `n3x-controller`: servidor gRPC com serviços que crescem com os plugins, inventário e estado dos sidecars, visualização somente leitura das configs, painel web em Echo v5 + templ + htmx, usuário root único e usuários de leitura definidos no `n3x.yaml` e extensão do controller por plugins
+- `n3x-sdk`: contratos de plugin de proxy e de controller, widgets do painel para as telas de plugin, memória isolada, pacote `secret` do formato `ENC[...]`, estrutura padrão de repositório de plugin, gerador de plugins `n3x-new`, kit de testes sem Envoy, plugin de exemplo com as duas metades e documentação do ciclo completo
+- `n3x-builder`: imagens de build por alvo (`envoy-1.40` e `istio-1.31`) e por arquitetura (amd64 e arm64), a ferramenta `n3x-plugin` embutida nelas e o catálogo de alvos
+- `n3x-plugin-core`: plugin obrigatório, sempre incluído, que faz o login de cada sidecar no controller e anexa o token de sessão a toda chamada, registra o sidecar, mantém o heartbeat e envia a config efetiva e os eventos; no controller, guarda em memória o inventário, as configs e os eventos e lê os usuários de leitura da própria seção no `n3x.yaml` do controller
+- Customização de plugins exclusivamente via Dockerfile multi-stage, gerando um único `libn3x.so` para o sidecar e o binário do controller
+- Sidecar como única porta de entrada da aplicação, para tráfego HTTP/1.1, HTTP/2 e gRPC
+- Configuração de cada serviço no próprio `n3x.yaml`, inclusive a seção `plugins`, com alterações só por redeploy
+- Compatibilidade com Istio por meio da imagem proxyv2 customizada e de um `EnvoyFilter` estático
+
+Fora de escopo
+- Plugins de comportamento de tráfego: rate limit local e global, forward com regras, redirects, headers, autenticação JWT, CORS e observabilidade
+- Observabilidade do tráfego da aplicação (métricas, access log e tracing por requisição)
+- Alteração da config dos sidecars pelo controller ou pelo painel
+- Tráfego de saída pelo sidecar e interceptação transparente por iptables
+- Injeção automática do sidecar
+- Connectors Go e Python como repositórios separados; cada plugin gera os próprios stubs e connectors
+- CLI de build, lockfile de build, assinatura de artefatos e SBOM
+- Plugins de terceiros e catálogo de plugins em níveis
+- Armazenamento próprio no controller: quem persiste dados é cada plugin, com o próprio banco
+- Banco do plugin core: na v1 o core guarda tudo em memória, e o banco entra na v2, atrás da mesma porta de armazenamento
+- Auditoria (FR-010), adiada para a v2; na v1, login, logout e bloqueio do painel ficam só no log JSON operacional do host, que não é auditoria formal
+- Gestão de usuários de leitura pelo painel (criar, desativar, remover, redefinir senha e troca da própria senha), adiada para a v2; na v1, os usuários mudam só no `n3x.yaml` do controller, com restart
+
+---
+
+### Requisitos funcionais
+
+#### FR-001 Bootstrap do sidecar por YAML
+O entrypoint da imagem lê o arquivo `n3x.yaml`, gera o bootstrap do Envoy e sobe o processo. Nenhum comportamento é configurado por variável de ambiente.
+
+**Fluxo principal**
+- O container sobe e o entrypoint lê `/etc/n3x/n3x.yaml`, ou o caminho passado em `--config`
+- O entrypoint valida os campos: nome do serviço, endereço do controller, credencial do serviço (`service` e `secret` em `ENC[...]`), porta de entrada, endereço da aplicação (ex.: `127.0.0.1:3000`), protocolo, limites de recursos e a seção `plugins` (instâncias, fase, ordem, política de falha e config de cada plugin)
+- O entrypoint valida a seção `plugins` contra o schema de cada plugin presente no manifesto do `.so`
+- O entrypoint detecta a identidade da instância: no Kubernetes usa o nome do pod com o hash (ex.: `pedidos-7d9f8b-xk2lp`); fora dele usa o ID do container
+- O entrypoint decifra os valores sensíveis no formato `ENC[...]` com a chave lida de um arquivo montado
+- O entrypoint define internamente o que o runtime Go exige (`GODEBUG=cgocheck=0`, `GOMAXPROCS` e `GOMEMLIMIT`), a partir do `n3x.yaml` e dos limites do container
+- O entrypoint gera o bootstrap do Envoy com admin só em localhost, listener de entrada, cluster da aplicação e um único filtro do N3X com a config dos plugins, carregando o `.so` do disco local
+- O entrypoint valida o bootstrap com `envoy --mode validate` e inicia o Envoy como processo filho, permanecendo como supervisor para repassar sinais e conduzir a drenagem
+
+**Fluxos alternativos e exceções**
+- Modo Istio: o entrypoint lê o mesmo `n3x.yaml`, aplica as variáveis do runtime Go e passa o controle ao pilot-agent, que gera o bootstrap e cuida da drenagem
+- Campo opcional ausente: usa o padrão documentado, por exemplo `GOMAXPROCS` igual às CPUs do container
+
+**Erros previstos**
+- YAML inválido, campo obrigatório ausente ou config de plugin fora do schema: o container encerra com código diferente de zero e mensagem indicando o campo
+- Valor sensível que não decifra: o container encerra com erro, sem logar o valor
+- Bootstrap reprovado no `--mode validate`: o container encerra e loga o bootstrap, sem segredos
+- `.so` ausente ou incompatível com o Envoy da imagem: o Envoy falha ao carregar e o container encerra
+
+**Prioridade:** alta
+
+---
+
+#### FR-002 Conexão do sidecar com o controller
+O core do `.so` abre uma única conexão gRPC criptografada e autenticada com o controller e a compartilha com os plugins. O tráfego da aplicação não depende dessa conexão.
+
+**Fluxo principal**
+- Quando o Envoy sobe, o core lê do `n3x.yaml` o endereço do controller e a credencial e abre a conexão gRPC com TLS 1.3 em segundo plano
+- O plugin core faz login em `n3x.plugins.n3x.core.v1.Login` com a credencial do serviço; o controller confere o segredo contra o hash bcrypt e devolve um token de sessão assinado (HMAC-SHA256), ligado ao serviço e à instância (FR-005)
+- O plugin core guarda o token no próprio espaço de memória e instala o interceptor que anexa o token a toda chamada de qualquer plugin ao controller; nenhum outro plugin enxerga o token
+- Uma goroutine renova o token ao atingir 80% do TTL de 1 h (cerca de 48 min), com jitter de 10%
+- Cada plugin com metade de controller recebe essa conexão pelo SDK e cria o próprio client gRPC sobre ela, usando-a só em tarefas de fundo, nunca durante uma requisição
+- O plugin core registra o sidecar (FR-016) e os demais plugins usam os próprios serviços
+- A conexão fica aberta, com keepalive, enquanto o processo viver
+
+**Fluxos alternativos e exceções**
+- Controller fora do ar quando o sidecar sobe: o tráfego e os plugins funcionam normalmente com a config local; a conexão tenta de novo com backoff e os dados destinados ao controller esperam num buffer pequeno em memória, que descarta os mais antigos
+- Controller cai depois: vale a mesma regra; quando ele volta, o plugin core faz login de novo, com jitter, e reenvia o registro completo
+- Enquanto o login não completa, as chamadas dos plugins ao controller esperam no buffer limitado ou recebem `UNAVAILABLE`
+- Nenhum controller configurado no `n3x.yaml`: o sidecar roda sozinho, sem painel (modo standalone)
+
+**Erros previstos**
+- Credencial do serviço inválida no login: o controller recusa com `UNAUTHENTICATED`; o sidecar loga, tenta de novo com backoff e continua servindo tráfego
+- Token de sessão expirado ou recusado (por exemplo, após restart do controller sem `session.hmac_key` configurada): o plugin core faz login de novo de forma transparente
+- Certificado do controller não confere: o sidecar não conecta, loga o motivo e continua servindo tráfego
+- Chamada de um plugin ao controller falha (timeout ou indisponível): o erro volta para o plugin, que decide o que fazer; a requisição da aplicação nunca trava, porque esse I/O acontece sempre em segundo plano
+
+**Prioridade:** alta
+
+---
+
+#### FR-003 Proxy de entrada HTTP e gRPC para a aplicação
+O sidecar é a única entrada da aplicação. Ele encaminha HTTP/1.1, HTTP/2 e gRPC até ela, expõe health check e drena as conexões no desligamento.
+
+**Fluxo principal**
+- O cliente conecta na porta pública do sidecar
+- O Envoy normaliza o path: barras duplicadas, barras escapadas e segmentos `..`
+- O Envoy executa a cadeia de plugins (FR-004)
+- O Envoy encaminha a requisição para o endereço local da aplicação definido no `n3x.yaml`, mantendo o protocolo
+- A resposta volta ao cliente pelo mesmo caminho
+
+**Fluxos alternativos e exceções**
+- gRPC: os plugins enxergam o método como `/pacote.Serviço/Método` e todo erro gerado pelo sidecar sai com o `grpc-status` correto
+- Health check: uma porta de health separada (padrão `17021`) responde pronto quando o Envoy está ativo e a aplicação passa no health check configurado no `n3x.yaml`; no modo Istio, valem as portas e o health do próprio Istio
+- Desligamento (SIGTERM): o entrypoint marca o sidecar como não pronto, drena as conexões em andamento pelo prazo do `n3x.yaml` (padrão de 20 s, abaixo dos 30 s comuns de Kubernetes e ECS) e só então encerra o Envoy
+
+**Erros previstos**
+- Aplicação fora do ar: 503 em HTTP e `UNAVAILABLE` em gRPC, contados nas métricas
+- Timeout da aplicação: 504 em HTTP e o status gRPC correspondente
+- Requisição malformada ou path inválido: 400, sem chegar na aplicação
+
+**Prioridade:** alta
+
+---
+
+#### FR-004 Execução da cadeia de plugins no `.so`
+Um único filtro do N3X no Envoy executa, dentro do `.so` único, todos os plugins habilitados na ordem de fases fixas e contém a falha de cada plugin, para que toda requisição sempre termine.
+
+**Fluxo principal**
+- A cadeia vem da seção `plugins` do `n3x.yaml`, com, por fase, a lista ordenada de plugins e a instância, a política de falha e a config de cada um
+- O módulo cria as instâncias dos plugins uma vez, na subida do Envoy
+- Em cada requisição, o filtro executa os plugins nas oito fases fixas: `access`, `authn`, `route`, `authz`, `traffic`, `transform`, `upstream` e `observe`; na resposta, a ordem é a inversa
+- Cada plugin pode seguir, negar ou disparar um trabalho assíncrono seguro e retomar depois
+- No fim da requisição, todos os plugins são notificados, inclusive quando houve negação
+
+**Fluxos alternativos e exceções**
+- Plugin nega: a cadeia para ali; em gRPC, a negação escreve `grpc-status` e `grpc-message` corretos, para não parecer sucesso
+- Plugin desligado para um recorte do serviço (prefixo de path, método HTTP ou serviço gRPC): não roda e não custa nada por requisição nesse recorte
+
+**Erros previstos**
+- Panic num plugin: é contido; com política fail-closed, a resposta é 500 ou 503 com o status gRPC correto; com fail-open, a cadeia segue; nos dois casos, o contador `panics_total` daquele plugin sobe
+- Panics repetidos no mesmo plugin: o plugin é desligado automaticamente até o próximo restart e o evento aparece no painel
+- Config inválida para um plugin, ou plugin exigido que não está no `.so`: o módulo recusa a config na criação, o Envoy não sobe e o container encerra com o motivo (FR-001)
+
+**Prioridade:** alta
+
+---
+
+#### FR-005 Servidor gRPC do controller
+O controller expõe um único servidor gRPC, com uma porta, um TLS e uma autenticação. Os serviços desse servidor crescem conforme os plugins são acoplados, a começar pelo serviço do plugin core.
+
+**Fluxo principal**
+- O controller sobe e abre a porta gRPC definida no `n3x.yaml` do controller (padrão `17443`), com TLS 1.3
+- Cada plugin com metade de controller registra o próprio serviço gRPC sob `n3x.plugins.<namespace>.<nome>.v1`, derivado do ID do plugin (FR-011)
+- Toda chamada passa por um interceptor de autenticação comum, que valida a assinatura e a validade do token de sessão emitido no login (FR-002), com o autenticador fornecido pelo plugin core, e identifica o serviço e a instância chamadores
+- O login (`n3x.plugins.n3x.core.v1.Login`) é a única chamada aceita sem sessão: o controller confere a credencial do serviço contra o hash bcrypt guardado no `n3x.yaml` do controller, com limite de tentativas por IP e por serviço
+- O controller não guarda tokens; a chave HMAC é do plugin core: vem de `session.hmac_key` (em `ENC[...]`, opcional e recomendada em produção) na seção do core no `n3x.yaml` do controller ou, sem ela, são 32 bytes aleatórios gerados na subida e mantidos só em memória
+- O token é um HMAC-SHA256 sobre serviço, instância, emissão, expiração e nonce, com TTL de 1 h, conferido com comparação em tempo constante
+- A chamada segue para o serviço do plugin, com a identidade do chamador no contexto
+- Toda chamada gera métrica e log com a identidade do chamador
+
+**Fluxos alternativos e exceções**
+- Várias instâncias do mesmo serviço usam a mesma credencial, mas cada uma recebe a própria sessão, ligada à identidade da instância (FR-016)
+- Restart do controller sem `session.hmac_key`: todas as sessões caem e os sidecars fazem login de novo, com jitter, sem afetar o tráfego; com a chave configurada, os tokens sobrevivem ao restart e os sidecars só reenviam o registro
+- Rotação da chave HMAC: troca no `n3x.yaml` do controller e restart, o que força um novo login de todos uma vez
+
+**Erros previstos**
+- Login com credencial inválida, ou chamada sem sessão ou com sessão inválida ou expirada: `UNAUTHENTICATED`
+- Tentativas de login acima do limite por IP e por serviço: `RESOURCE_EXHAUSTED`
+- Chamador autenticado, mas sem permissão para o método: `PERMISSION_DENIED`
+- Método desconhecido ou versão não suportada: `UNIMPLEMENTED`
+- Limite de conexões ou streams atingido: `RESOURCE_EXHAUSTED`
+
+**Prioridade:** alta
+
+---
+
+#### FR-006 Inventário e estado dos sidecars
+O controller, por meio do plugin core, mantém o registro de cada sidecar e mostra no painel o estado atual e o histórico recente de cada um. Na v1, o inventário fica só em memória.
+
+**Fluxo principal**
+- Quando o sidecar se registra (FR-016), o plugin core guarda em memória ou atualiza: serviço, instância (nome do pod no Kubernetes ou ID do container fora dele), endereço, alvo (`envoy-1.40` ou `istio-1.31`), versão do Envoy, manifesto de plugins, hash da config efetiva e horário de emissão da sessão
+- O controller acompanha a conexão pelo heartbeat: conectado, ou desconectado com o horário em que foi visto pela última vez
+- O painel lista os sidecars agrupados por serviço, com filtros por estado, alvo, versão e hash de config
+- O detalhe de um sidecar mostra a idade da sessão, os plugins do manifesto, a config efetiva (FR-007) e os eventos: panics, plugin desligado automaticamente, erro de config e início da drenagem
+
+**Fluxos alternativos e exceções**
+- Sidecar reconecta com a mesma identidade, como num restart do container no mesmo pod: o registro é atualizado, sem duplicar
+- Sidecar desconectado por mais tempo que o limite do `n3x.yaml` (padrão de 24 h): sai da lista ativa e fica só no histórico
+- Instâncias do mesmo serviço com hashes de config ou manifestos diferentes, como num rollout em andamento: o painel destaca a divergência
+- Lista de plugins do sidecar diferente da lista compilada no controller: o painel alerta, com base no manifesto anunciado
+- Restart do controller: o inventário, que fica só em memória, é reconstruído pelos sidecars; quando o controller não conhece a instância, o heartbeat pede o reenvio do registro e, com `session.hmac_key` configurada, o inventário volta em cerca de 10 s
+
+**Erros previstos**
+- Duas instâncias com a mesma identidade (segundo registro com outro nonce enquanto o primeiro stream está aberto, e as duas mandando heartbeat no mesmo intervalo): o controller marca conflito de identidade no painel e no log, as duas continuam conectadas e o conflito some sozinho após 3 intervalos sem heartbeat da antiga
+- Teto de memória do plugin core estourado (`memory_limit`, padrão de 128 MiB): ao chegar a 90%, o core descarta primeiro o histórico, depois os eventos mais antigos e depois versões de config sem instância; se ainda assim estourar, se marca como degradado, o painel mostra o banner (FR-008), continua aceitando heartbeats e estados e recusa nova versão de config com `RESOURCE_EXHAUSTED`
+
+**Prioridade:** alta
+
+---
+
+#### FR-007 Visualização das configs dos sidecars
+O controller mostra no painel a config efetiva de cada sidecar, enviada pelo plugin core, sem permitir edição. Mudar a config exige alterar o `n3x.yaml` do serviço e redeployar.
+
+**Fluxo principal**
+- Quando o sidecar sobe, o plugin core envia a config efetiva, com os valores sensíveis mascarados, e o hash dela; a config efetiva inclui a seção `plugins` e os parâmetros do sidecar, inclusive os da conexão com o controller
+- A config efetiva vai em JSON canônico (RFC 8785): `format`, `sidecar` com os parâmetros do sidecar e `plugins` com ID, instância, fase, ordem, política de falha e config de cada plugin
+- Todo campo marcado como segredo no schema (`plugin.Secret`), e também o `controller.secret` do sidecar, vira `***:<impressão digital>`, com os 12 primeiros caracteres hexadecimais do SHA-256 do texto `ENC[...]`, nunca do valor em claro; um segredo trocado muda o hash sem expor o valor
+- O hash é `sha256:<hex>` sobre o JSON já mascarado, e o controller o recalcula ao receber
+- O plugin core guarda a config em memória, por serviço e por instância, versionada pelo hash, com até 20 versões por serviço (descartando primeiro as que nenhuma instância usa)
+- O painel mostra, por serviço, a cadeia de plugins (fase, ordem e política de falha) e a config de cada instância de plugin, só para leitura
+- Quando uma instância sobe com um hash diferente do anterior do serviço, o painel mostra a mudança com o diff; o registro dela em auditoria fica para a v2 (FR-010)
+
+**Fluxos alternativos e exceções**
+- Instâncias do mesmo serviço com configs diferentes (rollout em andamento ou drift): o painel mostra os grupos lado a lado, com o diff
+- Plugin com schema: o painel exibe cada campo com nome e descrição; sem schema, mostra o YAML bruto
+- O usuário pode copiar o trecho YAML de um plugin para usar no `n3x.yaml` de outro serviço
+
+**Erros previstos**
+- Config recebida sem hash: o controller recusa com `INVALID_ARGUMENT`; hash que não bate com o recalculado (config corrompida): o controller recusa com `DATA_LOSS` e loga; nos dois casos, o painel mantém a última config válida e marca o sidecar com alerta
+- Segredo escrito em claro no `n3x.yaml`, sem `ENC[...]`: o sidecar envia `***:plain` no lugar do valor e um evento de alerta; o valor nunca sai do processo
+- Teto de memória do plugin core estourado: nova versão de config recusada com `RESOURCE_EXHAUSTED` (FR-006)
+
+**Prioridade:** alta
+
+---
+
+#### FR-008 Painel web
+Interface web servida pelo próprio controller, em Echo v5 + templ + htmx, para acompanhar sidecars, fluxos e configs. Ninguém altera a config dos sidecars pelo painel.
+
+**Fluxo principal**
+- O usuário acessa a porta HTTPS do painel definida no `n3x.yaml` do controller (padrão `17444`) e faz login (FR-009)
+- Visão geral: sidecars por estado, serviços, configs divergentes e alertas (panics, plugin desligado automaticamente e sidecar sem conexão)
+- Fluxo por serviço: a cadeia de plugins desenhada em ordem de fase, mostrando o que roda em cada etapa
+- Sidecars: lista e detalhe (FR-006)
+- Configs: visualização por serviço e por instância (FR-007)
+- Usuários: lista só leitura dos usuários de leitura, com nome e estado, só para o root (FR-009), tela do plugin core
+- A tela de auditoria não entra na v1 (FR-010)
+- As telas fornecidas por plugins aparecem no menu (FR-011), desenhadas pelo renderizador de widgets do SDK com o mesmo visual do painel
+- As atualizações de tela são parciais, via htmx, sem SPA; o status ao vivo usa polling curto (padrão de 5 s)
+
+**Fluxos alternativos e exceções**
+- Usuário de leitura: vê tudo, menos a lista de usuários
+- Sessão expirada: volta ao login e retorna à mesma página depois
+
+**Erros previstos**
+- Acesso sem sessão: redireciona para o login
+- Ação sem permissão: 403 com mensagem clara, bloqueada também no servidor
+- Plugin degradado ou falho (por exemplo, o core com o teto de memória estourado ou outro plugin com o banco dele fora do ar): um banner por plugin avisa e os dados mostrados são os últimos que o plugin tinha em memória
+
+**Prioridade:** alta
+
+---
+
+#### FR-009 Usuário root único e usuários de leitura
+O controller tem um único root, definido no `n3x.yaml` do controller com a senha em hash bcrypt. Na v1, os usuários de leitura também vêm só do `n3x.yaml` do controller, na seção do plugin core, e o painel apenas os lista.
+
+**Fluxo principal**
+- O operador gera o hash bcrypt da senha do root com `n3x-controller hash` ou qualquer ferramenta padrão (ex.: `htpasswd -B`) e coloca usuário e hash no `n3x.yaml` do controller
+- O controller sobe e lê o root do arquivo; o root nunca fica em banco, vem sempre do `n3x.yaml`
+- O root faz login no painel e o controller compara a senha com o hash
+- O operador declara os usuários de leitura em `plugins.n3x.core.users` no `n3x.yaml` do controller, cada um com nome, `password_hash` bcrypt (custo mínimo 12, campo segredo no schema) e `disabled`; o plugin core lê a lista na subida e a mantém em memória
+- O root vê no painel a lista dos usuários de leitura, com nome e estado, sem nenhuma ação
+- O usuário de leitura faz login e vê o painel em modo leitura (FR-008)
+
+**Fluxos alternativos e exceções**
+- Trocar a senha do root: altera o hash no `n3x.yaml` e reinicia o controller
+- Criar, desativar, remover ou trocar a senha de um usuário de leitura: altera a seção do core no `n3x.yaml` do controller e reinicia o controller; na v1, o painel não oferece essas ações nem a troca da própria senha
+- A sessão fica na memória do controller, referenciada por um cookie seguro, e expira após o período de inatividade definido no `n3x.yaml`; um restart do controller exige novo login
+- Plugin core falho ou degradado: só o root entra no painel
+
+**Erros previstos**
+- Login inválido: mensagem genérica, sem revelar se o usuário existe; depois de 5 tentativas seguidas, o login fica bloqueado por 15 minutos para aquele usuário e IP
+- `n3x.yaml` sem root, ou com um hash que não é bcrypt: o controller não sobe
+- Seção de usuários com nome duplicado, nome igual ao do root, hash que não é bcrypt ou custo menor que 12: o controller não sobe
+- Usuário de leitura tentando abrir a lista de usuários: 403
+
+**Prioridade:** alta
+
+---
+
+#### FR-010 Auditoria (fora da v1, adiada para a v2)
+O controller registra quem fez o quê e quando no painel, além das mudanças de config detectadas a cada deploy de serviço.
+
+Este requisito sai da v1 inteiro e volta na v2, junto com o banco do plugin core; o texto abaixo fica como referência para a v2. Na v1, não há gravador de auditoria, tela de auditoria nem retenção de 90 dias, e o login do painel não depende de gravar auditoria. Como paliativo, login, logout e bloqueio do painel ficam no log JSON operacional do host, que não é auditoria formal.
+
+**Fluxo principal**
+- Eventos registrados: login com sucesso e com falha e logout; criação, desativação e remoção de usuário e redefinição de senha; mudança de config de um serviço, com hash anterior, hash novo, diff com segredos mascarados, instância que trouxe a mudança e horário
+- Cada registro tem ator (usuário ou sidecar), ação, alvo, IP de origem e horário
+- O controller monta os eventos e o plugin core os grava no próprio banco
+- Os registros só recebem inclusões; ninguém edita nem apaga pelo painel
+- A tela de auditoria filtra por período, ator, ação e serviço
+
+**Fluxos alternativos e exceções**
+- Retenção: registros mais antigos que o prazo do `n3x.yaml` (padrão de 90 dias) são removidos automaticamente
+- Um recorte filtrado pode ser exportado em JSON ou CSV
+
+**Erros previstos**
+- Falha ao gravar a auditoria de uma ação do painel: a ação é recusada, porque não existe ação sem registro; a única exceção é o login de emergência do root com o plugin core falho, registrado no log do controller
+- Falha ao gravar uma mudança de config vinda de um sidecar: o controller tenta de novo e loga o erro, sem afetar o sidecar
+
+**Prioridade:** media (v2)
+
+---
+
+#### FR-011 Extensão do controller por plugins
+A metade de controller de um plugin acrescenta comportamento ao controller: serviços gRPC no servidor exposto, telas no painel e o schema da config do plugin.
+
+**Fluxo principal**
+- A imagem `controller-builder` compila o controller com a metade de controller de cada plugin listado no Dockerfile (FR-015)
+- Na subida, o controller registra cada plugin respeitando as dependências declaradas no manifesto: os serviços gRPC (`n3x.plugins.<namespace>.<nome>.v1`), as páginas e os cartões montados com widgets do SDK em `/plugins/<namespace>/<nome>/...` e o schema da config
+- O controller inicia os plugins e, no desligamento, para na ordem inversa
+- O painel mostra as telas no menu e o servidor gRPC passa a aceitar as chamadas dos clients desses plugins nos sidecars
+- A autenticação e a permissão (root, leitura ou sidecar) são aplicadas pelo controller antes de a chamada chegar ao plugin, que recebe a identidade de quem chamou
+
+**Fluxos alternativos e exceções**
+- Plugin sem metade de controller: aparece só no inventário e na visualização de config
+- Plugin que precisa guardar dados: traz a própria conexão de banco, configurada na seção dele no `n3x.yaml` do controller com segredos em `ENC[...]`; o controller não tem armazenamento, e um plugin acessa dados de outro só pela API pública dele
+- Toda tela e todo serviço de plugin exigem autenticação; a única rota pública da v1 é o login do plugin core (`n3x.plugins.n3x.core.v1.Login`, FR-005)
+
+**Erros previstos**
+- Dois plugins com o mesmo ID ou o mesmo nome de serviço gRPC: o build falha; se mesmo assim chegar à subida, o controller não sobe
+- Falha ao iniciar um plugin obrigatório, como o core: o controller não sobe; um plugin opcional que falha sobe desligado e aparece como falho no painel
+- Panic dentro de uma tela ou de um serviço de plugin: o controller contém o panic, responde 500 ou `INTERNAL` e registra o erro
+
+**Prioridade:** alta
+
+---
+
+#### FR-012 Contrato de plugin de proxy no SDK
+O SDK define as interfaces que a metade de proxy de um plugin implementa para rodar dentro do `.so`, sem depender do Envoy nem de cgo.
+
+**Fluxo principal**
+- O autor declara o manifesto do plugin (`n3x-plugin.yaml`): ID no formato `<namespace>.<nome>` (ex.: `giustech.ratelimit`, com o namespace `n3x` reservado aos plugins oficiais), fases permitidas, posição padrão dentro da fase e política de falha padrão
+- O autor implementa só os hooks de que precisa: headers de request, body de request, headers de response e fim da requisição; o body de response fica para uma versão futura do SDK
+- O plugin recebe a config já tipada e validada, vinda da seção `plugins` do `n3x.yaml`; o schema é gerado da struct Go da config, e os campos sensíveis usam o tipo `plugin.Secret`, que nunca aparece em log, erro ou JSON
+- Em cada hook, o plugin usa a API do SDK para ler e alterar headers, negar com status HTTP e código gRPC, disparar trabalho assíncrono seguro e registrar métricas e logs, sempre com o ID do plugin
+- Para falar com a metade de controller, o plugin pede ao SDK a conexão compartilhada (FR-002) e cria o client gRPC dele; as chamadas acontecem só em tarefa de fundo do SDK, e o token de sessão é anexado pelo plugin core sem ficar visível ao plugin
+- O plugin pode abrir conexões próprias (ex.: uma réplica de leitura Redis) pelo discador do SDK e usá-las durante a requisição, sempre com prazo e com a política de falha da instância
+- O plugin guarda valores voláteis num espaço de memória do SDK preso ao próprio ID, com cota (padrão de 16 MiB no sidecar e 64 MiB no controller, com descarte do mais antigo) e sem acesso ao espaço de outro plugin
+- O autor testa o plugin com o kit de testes do SDK, sem Envoy (FR-014)
+
+**Fluxos alternativos e exceções**
+- Recurso que existe num alvo e não no outro (ex.: no Envoy 1.40, mas não no istio-proxy 1.31): o SDK informa a ausência e o plugin desliga aquela funcionalidade de forma explícita, sem falhar em silêncio
+- Só plugins das fases até `route` podem alterar a rota da requisição; as fases seguintes não têm essa API, o que evita escalada de privilégio
+
+**Erros previstos**
+- Uso de `go` cru, `os.Exit`, `log.Fatal` ou `init()` com efeitos colaterais: o `n3x-plugin build` recusa o plugin na análise estática
+- Uso de `unsafe` ou `reflect` sobre tipos do SDK, que furaria o isolamento de memória entre plugins: o build recusa
+- Plugin que importa o SDK do Envoy ou usa cgo: o build recusa
+- Plugin que usa a conexão com o controller durante uma requisição: o SDK devolve erro na hora, sem esperar
+- Plugin que importa o pacote `secret` do SDK ou usa `context.Background()`: o build recusa
+
+**Prioridade:** alta
+
+---
+
+#### FR-013 Contrato de plugin de controller no SDK
+O SDK define as interfaces que a metade de controller de um plugin implementa para registrar serviços gRPC, páginas e cartões em widgets e o schema da config no controller.
+
+**Fluxo principal**
+- O autor declara no manifesto o ID do plugin, as dependências de outros plugins e se ele é obrigatório
+- O autor implementa só as capacidades de que precisa: serviços gRPC, telas do painel, schema da config, validação da config, cartões da visão geral, estado do plugin, memória isolada, início e parada; o banco, quando houver, é do próprio plugin
+- O plugin registra o server gRPC gerado a partir do próprio `.proto` no registrador que o controller entrega
+- O plugin registra páginas sob `/plugins/<namespace>/<nome>/` e cartões da visão geral como uma árvore de widgets do SDK (layout, tabela, gráfico, detalhe, formulário e outros), um dentro do outro; o renderizador do SDK gera o HTML com o visual e a acessibilidade do painel, e nenhum plugin escreve HTML
+- Em cada chamada, o plugin recebe do controller a identidade e o papel de quem chamou: root, leitura ou sidecar
+- O autor testa a metade de controller com o host falso do kit de testes (FR-014)
+
+**Fluxos alternativos e exceções**
+- Plugin só com schema: o painel exibe a config com nomes e descrições, sem tela própria
+- Plugin que precisa de dados de outro plugin: declara a dependência no manifesto e acessa os dados só pela API pública do outro plugin
+
+**Erros previstos**
+- Plugin que tenta registrar um serviço fora do próprio namespace (`n3x.plugins.<namespace>.<nome>.v1`) ou uma rota fora de `/plugins/<namespace>/<nome>/`: o controller recusa na subida
+- Plugin com ID no namespace `n3x` vindo de fora dos repositórios oficiais: o build recusa
+- Plugin que não é o core tentando registrar interceptor de conexão, autenticador de sessão, rota pública, diretório de usuários ou gravador de auditoria (reservado para a v2): o SDK e o controller recusam na subida
+- Dependência declarada que não está na imagem: o build falha
+- Plugin que importa pacotes internos do controller: o build recusa
+
+**Prioridade:** alta
+
+---
+
+#### FR-014 Estrutura padrão de repositório de plugin e kit de testes
+O SDK documenta, com um plugin de exemplo, a estrutura que todo repositório de plugin segue e oferece um kit de testes que roda sem Envoy e sem controller.
+
+**Fluxo principal**
+- O autor cria o repositório com o gerador do SDK (`n3x-new <namespace>.<nome>`), que parte do plugin de exemplo (`n3x.example`); o exemplo tem as duas metades: no sidecar, adiciona um header e nega um path configurável, em HTTP e em gRPC; no controller, recebe a contagem de negações e a mostra num cartão. Ele roda nos testes de integração da plataforma
+- O autor organiza o repositório com: `n3x-plugin.yaml` na raiz como manifesto do plugin (ID, fase, metades, dependências e obrigatoriedade); `agent/` com a metade de proxy; `controller/` com a metade de controller; `types/` com o schema e os tipos de config compartilhados pelas duas metades; `proto/` com o contrato gRPC e os stubs de server e de client gerados; e `connectors/` com os connectors do plugin, quando houver
+- O autor escreve os testes com o kit: requisição, config e métricas falsas, um agendador determinístico para trabalho assíncrono, um host falso de controller e um servidor gRPC em memória, tudo rodando com `go test -race`
+- A documentação do SDK explica o ciclo completo: criar, testar, adicionar ao Dockerfile (FR-015) e configurar no `n3x.yaml` do serviço
+
+**Fluxos alternativos e exceções**
+- Plugin só de proxy ou só de controller: a pasta da outra metade é omitida
+- Plugin que não fala com o controller: dispensa a pasta `proto/` e os stubs
+
+**Erros previstos**
+- Repositório fora da estrutura (manifesto ausente, ou metade declarada sem pasta): o `n3x-plugin add` falha e diz o que falta
+- Stubs desatualizados em relação ao `.proto`: o build falha
+- Versão nova do plugin que remove, renomeia ou torna obrigatório um campo de config dentro da mesma major: a checagem de schema na CI do plugin falha
+
+**Prioridade:** alta
+
+---
+
+#### FR-015 Build de plugins por Docker (`n3x-builder`)
+O repositório `n3x-builder` publica imagens de build por alvo que compilam, dentro do Docker, o `.so` único do sidecar e o binário do controller com os plugins escolhidos.
+
+**Fluxo principal**
+- O operador escreve um Dockerfile multi-stage a partir de `ghcr.io/giustech/n3x/sidecar-builder:<semver>-<alvo>`, com os alvos `envoy-1.40` e `istio-1.31`; cada imagem tem semver próprio
+- O operador adiciona cada plugin com `RUN n3x-plugin add <módulo>@<versão>`; o plugin core entra sempre, sem precisar ser declarado
+- O `RUN n3x-plugin build` resolve as dependências com o toolchain Go fixado na imagem, checa a compatibilidade de cada plugin com a versão do SDK da imagem, roda a análise estática (FR-012) e o `govulncheck` (só aviso), gera o registro dos plugins e compila um único `libn3x.so`, de forma reproduzível (mesma entrada, mesmo hash)
+- O `n3x-plugin build` verifica os símbolos do `.so` contra o Envoy do alvo, que vem dentro da própria imagem, faz um teste de carga do `.so` nesse Envoy quando o build roda na arquitetura nativa e gera o manifesto (plugins, versões, alvo, versão do `core/` compilado, avisos e hash SHA-256 das seções carregáveis), embutido no `.so` numa seção ELF
+- O estágio final parte de `ghcr.io/giustech/n3x/sidecar:<semver>-<alvo>` e copia o `.so`; na subida, o sidecar aceita um `.so` cujo `core/` tenha a mesma major e minor igual ou menor que a da imagem
+- O controller segue o mesmo fluxo, com `ghcr.io/giustech/n3x/controller-builder:<semver>` e `ghcr.io/giustech/n3x/controller:<semver>` (sem sufixo de alvo) e a mesma lista de plugins, gerando o binário com as metades de controller
+
+**Fluxos alternativos e exceções**
+- amd64 e arm64: as imagens de build são multi-arquitetura, via `docker buildx`
+- Plugin em repositório privado: a credencial de acesso entra como secret de build do Docker e não fica na imagem final
+- Listas de plugins diferentes no sidecar e no controller: o build passa, mas o controller detecta a diferença pelo manifesto e alerta no painel (FR-006)
+
+**Erros previstos**
+- Plugin incompatível com a versão do SDK: o build falha e mostra a versão exigida e a disponível
+- Dois plugins com o mesmo ID: o build falha
+- Símbolo ausente no Envoy do alvo: o build falha antes de gerar a imagem, evitando um `.so` que carrega no istio-proxy e só cai na primeira chamada
+- Plugin reprovado na análise estática: o build falha e lista as regras violadas
+- Tentativa de remover o plugin core: o build falha
+- `.so` que não carrega no Envoy do alvo (teste de carga): o build falha
+- Imagem de runtime incompatível com a versão do `core/` ou do `host/` do manifesto: o sidecar ou o controller não sobe e diz qual versão usar
+- Vulnerabilidade encontrada pelo `govulncheck`: o build passa, mostra o aviso e grava no manifesto
+- Toda falha do build tem um código estável (`N3X-B001` a `N3X-B013`), uma linha de como resolver e o link para a documentação
+
+**Prioridade:** alta
+
+---
+
+#### FR-016 Plugin core (registro do sidecar)
+Plugin obrigatório, sempre incluído, que registra cada sidecar no controller, mantém o heartbeat e envia a config efetiva e os eventos que alimentam o inventário e o painel.
+
+**Fluxo principal**
+- Na subida, a metade de proxy faz o login (FR-002) e, já com a sessão, usa a conexão compartilhada para registrar o sidecar, com serviço, instância, alvo, versão do Envoy, manifesto e config efetiva com segredos mascarados, junto com o hash dela
+- A metade de proxy mantém um stream de heartbeat, com o intervalo de `controller.heartbeat_interval` no `n3x.yaml` do sidecar (padrão de 10 s), enviado no registro
+- A metade de proxy envia eventos, cada um com um ID de idempotência que evita duplicar na reconexão: panics por plugin, plugin desligado automaticamente, circuit breaker aberto, erro de config, segredo em claro e início da drenagem no desligamento
+- No desligamento, a metade de proxy avisa que está saindo, em melhor esforço dentro de 2 s, para o controller marcar o sidecar como desconectado sem esperar timeout
+- A metade de proxy não roda em nenhuma fase da requisição: todo o trabalho do core fica em segundo plano, sem custo no caminho do tráfego
+- A metade de controller implementa o server e, na v1, guarda em memória o inventário (FR-006), as configs (FR-007) e os eventos (até 200 por instância, com histórico de 24 h) e lê os usuários de leitura (FR-009) da própria seção no `n3x.yaml` do controller; fornece o autenticador de sessão usado pelo interceptor do servidor gRPC (FR-005), o diretório de usuários só leitura usado pelo controller e as telas de sidecars, configs, fluxo por serviço e usuários do painel (FR-008); não fornece gravador de auditoria na v1 (FR-010)
+
+**Fluxos alternativos e exceções**
+- Três intervalos de heartbeat seguidos sem ping: o controller marca o sidecar como desconectado
+- Controller fora do ar: vale o buffer em memória do FR-002, e o registro é reenviado após novo login na reconexão
+- Controller reiniciado que não conhece a instância: a resposta do heartbeat pede o reenvio do registro
+- Capacidades privilegiadas (interceptor de conexão, autenticador de sessão, rota pública de login e diretório de usuários) são exclusivas do plugin core; o gravador de auditoria fica reservado para a v2
+- O mascaramento de segredos usa os campos marcados como segredo no schema de cada plugin (FR-007)
+
+**Erros previstos**
+- Registro com identidade inválida ou campos ausentes: o controller recusa com `INVALID_ARGUMENT` e o sidecar loga o motivo
+- Registro, evento, saída ou heartbeat com identidade diferente da do token de sessão: o controller recusa com `PERMISSION_DENIED` e loga um alerta
+- Config com hash que não bate: `DATA_LOSS` (FR-007); teto de memória do core estourado para uma nova versão de config: `RESOURCE_EXHAUSTED` (FR-006)
+- Proto do core em versão incompatível entre sidecar e controller: o controller aceita versões da mesma major; fora disso, recusa com `FAILED_PRECONDITION` e registra o evento
+
+**Prioridade:** alta
+
+---
+
+### Requisitos não funcionais
+
+Performance
+- Latência adicionada pelo sidecar, com o plugin core e o plugin de exemplo ativos: p50 menor ou igual a 0,5 ms e p99 menor ou igual a 2 ms a 1.000 rps, medida com carga open-loop abaixo do joelho da curva
+- Mecanismo de plugins sem custo extra: 0 alocações por operação nos caminhos comuns do SDK e no máximo 5 entradas do Envoy no Go por requisição, independentemente do número de plugins ativos
+- Sidecar ocioso com até 100 MB de memória e 0,05 vCPU
+- Sidecar pronto para receber tráfego em até 5 s depois que o container sobe
+- Controller atende 500 sidecars conectados com 1 vCPU e 512 MB, com o painel respondendo em p95 menor que 300 ms
+
+Disponibilidade
+- Zero requisições da aplicação com erro causado por indisponibilidade do controller
+- Controller com 99,5 por cento de disponibilidade mensal
+- Zero requisições cortadas em rolling update, dentro do prazo de drenagem
+- Depois de um restart do controller, os sidecars voltam ao painel em até 30 s: cerca de 10 s quando `session.hmac_key` está configurada; sem ela, todos refazem o login, mas o cache de credencial por serviço limita o custo a cerca de um bcrypt por serviço, e a meta vale até cerca de 200 serviços
+
+Segurança e autorização
+- TLS 1.3 na conexão entre sidecar e controller e no painel
+- Sidecar autenticado por credencial por serviço (`service` e `secret`): o `n3x.yaml` do controller guarda só o hash bcrypt do segredo e o `n3x.yaml` do sidecar guarda o segredo cifrado no formato `ENC[...]`; a credencial trafega só no login, que devolve um token de sessão HMAC-SHA256 por instância, com TTL de 1 h e renovação em 80% do prazo, mantido só em memória no sidecar e nunca armazenado pelo controller
+- bcrypt com custo mínimo de 12 para tudo que só é conferido: root, usuários de leitura e credenciais de serviço
+- AES-256-GCM para os segredos que precisam ser lidos, com a chave num arquivo montado no container, nunca em variável de ambiente; a chave HMAC das sessões, quando configurada, vem de `session.hmac_key` em `ENC[...]` na seção do plugin core no `n3x.yaml` do controller
+- Nenhum segredo ou token de sessão em log, em mensagem de erro ou na config enviada ao controller
+- Painel com cookie de sessão `HttpOnly`, `Secure` e `SameSite=Strict`, proteção contra CSRF em toda ação, CSP restrita ao próprio domínio e nenhum JavaScript externo
+- Autorização aplicada pelo controller antes de qualquer handler de plugin
+- Admin do Envoy só em localhost (`127.0.0.1:17001`); a aplicação nunca fica exposta, só o sidecar
+- Análise estática e `govulncheck` em todo build e imagens base fixadas por digest
+
+Observabilidade
+- Logs JSON estruturados no entrypoint, no core do `.so` e no controller, sempre com serviço, instância e ID do plugin
+- Métricas Prometheus do controller: sidecars conectados e chamadas gRPC por método e status; as métricas de negócio do plugin core usam o prefixo `n3x_n3x_core_*` (sidecars por estado, divergências, conflitos de identidade, registros, logins, eventos, memória usada e estado degradado)
+- Métricas Prometheus do sidecar: estado da conexão com o controller, `panics_total` por plugin e plugins desligados automaticamente
+- Health e readiness no sidecar e no controller
+- Esses sinais cobrem a operação do próprio N3X; a observabilidade do tráfego da aplicação está fora do escopo da v1
+
+Confiabilidade e integridade de dados
+- Toda requisição termina: o panic de um plugin é contido e segue a política de falha da instância
+- Um único runtime Go por processo do Envoy, com o `.so` sempre carregado do disco local, nunca de fonte remota
+- `GOMEMLIMIT` e o overload manager do Envoy com monitor de memória do cgroup evitam OOM; `GOMAXPROCS` fica sempre maior ou igual ao número de workers do Envoy
+- A config só muda com redeploy e o hash reportado ao controller sempre corresponde à config em uso
+- Na v1, o plugin core guarda inventário, configs e eventos só em memória, com teto (`memory_limit`, padrão de 128 MiB) e reconstrução pelos sidecars após um restart do controller, que roda com uma réplica só; a auditoria, que só recebe inclusões, entra na v2
+
+Compatibilidade e portabilidade
+- Alvos: Envoy 1.40 ou superior (imagem oficial) e istio-proxy 1.31 (proxyv2), em amd64 e arm64, com um `.so` por commit do Envoy
+- Kubernetes, ECS e docker compose, sem recurso exclusivo de nenhum orquestrador; Istio só como compatibilidade
+- HTTP/1.1, HTTP/2 e gRPC, com a aplicação escrita em qualquer linguagem
+- Protos dos plugins evoluem só por adição dentro da mesma major, com verificação por `buf breaking`
+- A config de cada plugin evolui só por adição dentro da major do plugin, com verificação de schema na CI do plugin
+- SDK em semver estrito, estável desde a v1.0
+- Imagens publicadas no formato OCI
+
+Compliance
+- A trilha de auditoria de logins, usuários e mudanças de config, com retenção de 90 dias, sai da v1 e entra na v2 (FR-010)
+- IP e nome de usuário tratados como dados pessoais (LGPD): na v1, ficam só em memória no plugin core, por até 24 h, com acesso só para usuários autenticados
+
+Acessibilidade no frontend consumidor
+- Painel web com contraste e navegação por teclado no nível WCAG 2.1 AA, com todo campo e todo botão rotulado
+
+---
+
+### Arquitetura e abordagem
+
+Abordagem
+- Sidecar Envoy por aplicação, como única porta de entrada dela, com um único `.so` em Go (dynamic module) carregado do disco e um único filtro do N3X que executa todos os plugins dentro do Go, em oito fases fixas. A config é estática, vem do `n3x.yaml` local de cada serviço e só muda com redeploy
+- Controller central apenas observador, com um servidor gRPC cujos serviços crescem com os plugins e um painel web somente leitura para as configs. O controller fica fora do caminho crítico: se ele cair, o tráfego e os plugins continuam funcionando
+- Tudo é plugin, inclusive o registro do sidecar (plugin core). Cada plugin tem até duas metades (proxy e controller) e traz o próprio `.proto` com os stubs de server e de client
+- Plugins compilados nas imagens por Dockerfile multi-stage, a partir das imagens de build do `n3x-builder`, gerando um `.so` por commit do Envoy e por arquitetura
+- Comunicação: gRPC com TLS 1.3 entre sidecar e controller, numa única conexão compartilhada pelos plugins, com stream de heartbeat; HTTPS no painel. Não há fila, mensageria nem cache externo
+- Modo Istio: o entrypoint lê o `n3x.yaml`, aplica as variáveis do runtime Go e passa o controle ao pilot-agent; um `EnvoyFilter` estático, igual para toda a malha, insere o filtro do N3X apontando para o `n3x.yaml` montado no pod; a conexão do `.so` com o controller sai direto, porque o Istio não intercepta o tráfego do próprio proxy
+
+Componentes
+- `n3x-sidecar`: imagem de runtime (Envoy oficial 1.40 ou proxyv2 do Istio 1.31), entrypoint supervisor em Go e core do `.so` (executor da cadeia, adaptador por alvo, conexão gRPC compartilhada e contenção de falhas por plugin)
+- `n3x-controller`: binário Go com servidor gRPC (TLS, sessão por token e interceptor de autorização), painel em Echo v5 + templ + htmx, host de plugins (serviços, telas e schemas), sem armazenamento próprio
+- `n3x-sdk`: contratos de proxy e de controller, widgets do painel, memória isolada, pacote `secret`, gerador `n3x-new`, kit de testes, plugin de exemplo e documentação
+- `n3x-builder`: imagens `sidecar-builder` (por alvo e arquitetura) e `controller-builder` (por arquitetura) no GHCR, ferramenta `n3x-plugin` e catálogo de alvos
+- `n3x-plugin-core`: `.proto` e stubs, metade de proxy (login, renovação da sessão, interceptor, registro, heartbeat e eventos) e metade de controller (autenticador de sessão, diretório de usuários só leitura, inventário, configs, eventos e telas, tudo em memória na v1; banco próprio e gravador de auditoria na v2)
+
+Integrações
+- Imagens base fixadas por digest: `envoyproxy/envoy:v1.40.x` e `istio/proxyv2:1.31.x`
+- Go module proxy e GitHub, para baixar os plugins durante o build
+- Registro de containers do operador, onde as imagens finais são publicadas
+- Prometheus, opcional, coletando as métricas operacionais do N3X
+- Orquestradores (Kubernetes, ECS e docker compose), integrados apenas pela configuração dos containers
+
+### Decisões e trade-offs
+
+#### Decisão: Plugins num dynamic module Go dentro do Envoy, e não num serviço externo (ext_authz ou ext_proc), no filtro Golang contrib, em Lua ou em Wasm
+- **Justificativa:** overhead mínimo e Go de verdade; o filtro HTTP de dynamic modules é estável desde o Envoy 1.38, o filtro Golang contrib é alpha e Lua e Wasm não rodam drivers nativos
+- **Trade-off:** um erro fatal do Go derruba o Envoy, porque não há isolamento de processo; o SDK Go do Envoy não tem versão com tag e a depuração é mais difícil
+
+#### Decisão: Um único `.so` e um único filtro do N3X no Envoy
+- **Justificativa:** o Go aceita um runtime por processo, e um filtro só mantém cerca de 5 cruzamentos entre Envoy e Go por requisição, independentemente do número de plugins
+- **Trade-off:** o core reimplementa a iteração de filtros do Envoy e as estatísticas por filtro do Envoy se perdem
+
+#### Decisão: Config estática por serviço no `n3x.yaml`, alterada só por redeploy, com o controller apenas observando
+- **Justificativa:** previsibilidade, config versionada junto do serviço e controller fora do caminho crítico
+- **Trade-off:** nenhuma mudança de comportamento a quente
+
+#### Decisão: Bootstrap por YAML com entrypoint supervisor em Go
+- **Justificativa:** uma única fonte de config, validada antes de subir, e drenagem controlada no desligamento
+- **Trade-off:** mais um componente para manter, que no Istio convive com o pilot-agent
+
+#### Decisão: Plugins compilados via Docker multi-stage no `n3x-builder`, sem CLI
+- **Justificativa:** o Docker já é necessário e o toolchain travado na imagem dá o mesmo resultado em qualquer máquina
+- **Trade-off:** a v1 fica sem lockfile, assinatura e SBOM, e o sidecar e o controller precisam receber a mesma lista de plugins
+
+#### Decisão: Um `.so` por commit exato do Envoy e por arquitetura, com verificação de símbolos
+- **Justificativa:** o istio-proxy 1.31 não tem barreira de panic e resolve símbolos de forma tardia, então um `.so` errado só cairia em produção
+- **Trade-off:** a matriz de imagens cresce a cada alvo, patch do Istio e arquitetura
+
+#### Decisão: SDK próprio, com plugins que nunca importam o SDK do Envoy nem usam cgo
+- **Justificativa:** contrato estável entre alvos com APIs diferentes e testes sem Envoy
+- **Trade-off:** recursos novos do Envoy chegam aos plugins com atraso e há mais uma camada para manter
+
+#### Decisão: Oito fases fixas, com ordem livre só dentro de cada fase
+- **Justificativa:** ordem previsível e segura, já que só as fases até `route` podem mudar a rota
+- **Trade-off:** menos flexibilidade, e mudar as fases depois sai caro
+
+#### Decisão: Contenção de falhas própria por plugin (recover, política de falha, negação ciente de gRPC, trabalho assíncrono seguro e análise estática)
+- **Justificativa:** a barreira de panic do Envoy 1.40 é parcial e a do istio-proxy 1.31 não existe; sem isso, uma negação gRPC chegaria ao cliente como sucesso
+- **Trade-off:** código a mais no caminho quente, que ainda assim não cobre erros fatais do Go
+
+#### Decisão: Servidor gRPC único no controller, com protos dentro de cada plugin e uma conexão compartilhada no `.so`
+- **Justificativa:** cada plugin é dono do próprio contrato, com uma conexão e uma autenticação só
+- **Trade-off:** protos espalhados pelos repositórios dos plugins e I/O de rede dentro do processo do Envoy
+
+#### Decisão: Registro do sidecar como plugin obrigatório (`n3x-plugin-core`)
+- **Justificativa:** tudo é plugin, e o core prova o modelo das duas metades de ponta a ponta
+- **Trade-off:** o inventário depende do mecanismo de extensão e o core não pode ser removido
+
+#### Decisão: Autenticação por TLS, credencial por serviço e sessão HMAC por instância, com bcrypt no controller e `ENC[...]` no sidecar
+- **Justificativa:** leve, sem autoridade certificadora para os sidecars, igual em Kubernetes, ECS e docker compose, com a credencial trafegando só no login e identidade por instância na sessão (ADR-003 e ADR-004 do `n3x-sdk`)
+- **Trade-off:** uma credencial vazada vale para o serviço inteiro até ser trocada, uma sessão não pode ser revogada antes de expirar e o login é a única rota pública
+
+#### Decisão: Controller sem armazenamento, com cada plugin trazendo o próprio banco e o plugin core guardando tudo em memória na v1
+- **Justificativa:** host menor e sem dependência de banco, isolamento natural entre plugins e cada plugin escolhendo o banco adequado (ADR-002 e ADR-003 do `n3x-controller`); na v1 o controller tem uma réplica só e o estado observado se reconstrói pelos sidecars, então o core dispensa banco, com os usuários de leitura vindos do `n3x.yaml` e o banco entrando na v2 atrás da mesma porta de armazenamento (ADR-001, ADR-002 e ADR-003 do `n3x-plugin-core`)
+- **Trade-off:** cada plugin reimplementa conexão, migrations e retenção; na v1, um restart do controller apaga o histórico e os eventos do core, o controller não roda com várias réplicas, a auditoria formal fica para a v2 e mudar usuários de leitura exige editar o `n3x.yaml` e reiniciar o controller
+
+#### Decisão: Painel em Echo v5 + templ + htmx, com as telas de plugin montadas como árvore de widgets do SDK
+- **Justificativa:** sem SPA, sem build de frontend e sem JavaScript externo; visual, acessibilidade e segurança garantidos num lugar só, porque nenhum plugin escreve HTML e o contrato não depende do Echo (ADR-018 do `n3x-sdk`)
+- **Trade-off:** interações mais limitadas, uma tela que o catálogo de widgets não cobre espera uma versão nova do SDK, e uma tela nova de plugin exige recompilar o controller
+
+#### Decisão: ID de plugin no formato `<namespace>.<nome>` e manifesto `n3x-plugin.yaml`
+- **Justificativa:** um formato só, derivado de forma mecânica para gRPC (`n3x.plugins.<namespace>.<nome>.v1`), rotas (`/plugins/<namespace>/<nome>/`) e métricas, sem colisão entre autores; o manifesto com nome próprio não se confunde com o `n3x.yaml` do operador (ADR-012 e ADR-013 do `n3x-sdk`)
+- **Trade-off:** nomes mais longos, como `n3x.plugins.n3x.core.v1.Login`
+
+#### Decisão: Conexão com o controller só em segundo plano, com conexões próprias do plugin permitidas na requisição
+- **Justificativa:** o controller nunca entra no caminho do tráfego, mas um plugin pode ler dados compartilhados de baixa latência, como uma réplica Redis local alimentada pela metade de controller (ADR-016 do `n3x-sdk`)
+- **Trade-off:** bibliotecas de connector criam goroutines fora da contenção de falhas do SDK, e os dados lidos da réplica podem estar defasados
+
+#### Decisão: SDK estável desde a v1.0, sem APIs experimentais
+- **Justificativa:** um contrato só, com semver estrito e depreciação de no mínimo 6 meses até a próxima major (ADR-021 do `n3x-sdk`)
+- **Trade-off:** um erro de design descoberto depois da v1.0 só se corrige numa major
+
+#### Decisão: Istio só como compatibilidade, via `EnvoyFilter` estático
+- **Justificativa:** o N3X não exige Kubernetes nem Istio, e a imagem e a config por serviço são as mesmas
+- **Trade-off:** o `EnvoyFilter` é frágil entre versões do Istio e esse suporte não é oficial
+
+#### Decisão: Observabilidade do tráfego fora da v1
+- **Justificativa:** foco em entregar a base da plataforma
+- **Trade-off:** a v1 não entrega comportamento de rede além do plugin de exemplo
+
+---
+
+### Dependências
+
+#### Técnica: Imagem oficial do Envoy 1.40 e SDK Go de dynamic modules
+O alvo `envoy-1.40` depende da imagem `envoyproxy/envoy:v1.40.x` e do SDK Go no commit da tag v1.40.0. Como esse SDK é publicado só em pseudo-versões, sem tag, a pseudo-versão precisa ser confirmada com `go list -m` antes de entrar no catálogo de alvos do `n3x-builder`.
+
+#### Técnica: istio-proxy 1.31 com dynamic modules
+O alvo `istio-1.31` depende de a imagem proxyv2 1.31.x carregar dynamic modules e exportar os símbolos que o SDK usa. Isso precisa ser validado num teste de carga do `.so` antes de o alvo ser declarado suportado. O commit do Envoy é derivado do `istio.deps` a cada patch do Istio.
+
+#### Técnica: Toolchain Go e C fixados
+As imagens do `n3x-builder` precisam trazer Go 1.26 ou superior, um toolchain C com glibc igual ou anterior à das imagens do Envoy e `zig cc` para compilar arm64.
+
+#### Técnica: Bibliotecas do controller
+O controller depende do Echo v5 (já estável, versão 5.4.0 de 27/09/2026), de templ, htmx, grpc-go e protobuf, e do buf para gerar os stubs e checar a compatibilidade dos protos.
+
+#### Organizacional: HLD do banco do plugin core (resolvida)
+Resolvida pelo HLD do `n3x-plugin-core`: na v1 o core guarda tudo em memória, sem banco, com teto de memória (padrão de 128 MiB), retenção de 24 h e estado degradado quando o teto estoura; os usuários de leitura vêm do `n3x.yaml` do controller e a auditoria (FR-010) sai da v1. O banco da v2, que traz a auditoria de volta e permite várias réplicas do controller, continua pendente.
+
+#### Externa: Registro de containers e repositórios
+As imagens `n3x/*` são publicadas no GitHub Container Registry (`ghcr.io/giustech/n3x/*`) e os cinco repositórios ficam no GitHub. O build de plugins precisa de acesso ao Go module proxy e ao GitHub, com secret de build para repositórios privados.
+
+#### Externa: Política de ABI do Envoy
+A partir da 1.40, a interface entre o Envoy e os dynamic modules só cresce por adição. O N3X depende dessa promessa para que o `.so` do alvo `envoy-1.40` continue funcionando em cada patch 1.40.x, o que é verificado na CI a cada patch.
+
+---
+
+### Riscos e mitigação
+
+#### Erro fatal do Go ou crash em C dentro do `.so` derruba o Envoy
+- **Probabilidade:** media
+- **Impacto:** o serviço perde a entrada até o container reiniciar
+- **Mitigação:**
+  - Instâncias de plugin imutáveis e estado por requisição
+  - Testes com `-race` e fuzzing no kit de testes
+  - Análise estática no build, com cgo proibido em plugins
+  - `GOMEMLIMIT` e controle de memória do Envoy contra OOM
+- **Plano de contingência:** o orquestrador reinicia o container, o plugin problemático sai do `n3x.yaml` ou da imagem e o serviço é redeployado; mais de uma réplica por serviço reduz o efeito
+
+#### Bugs ao reimplementar a iteração de filtros do Envoy dentro do core
+- **Probabilidade:** media
+- **Impacto:** requisições presas até o timeout ou mudanças de header não aplicadas
+- **Mitigação:**
+  - Suíte de conformidade com casos golden em HTTP e gRPC
+  - Testes de propriedade sobre seguir, parar e retomar
+  - Plugin de exemplo rodando nos testes de integração com Envoy real
+- **Plano de contingência:** os timeouts do Envoy encerram a requisição e o plugin envolvido é desligado no `n3x.yaml`, com redeploy
+
+#### Suporte não oficial ao Istio quebra num patch do Istio
+- **Probabilidade:** alta
+- **Impacto:** o N3X não carrega, ou derruba o proxy, num cluster com Istio
+- **Mitigação:**
+  - CI por patch do Istio
+  - Verificação de símbolos no build e teste de carga na imagem exata
+  - `EnvoyFilter` restrito à versão do proxy suportada
+- **Plano de contingência:** fixar a versão do Istio suportada no catálogo e, naquele serviço, rodar o sidecar do N3X sem Istio
+
+#### SDK Go do Envoy, sem versões com tag, muda e quebra o adaptador
+- **Probabilidade:** alta
+- **Impacto:** atraso para suportar versões novas do Envoy
+- **Mitigação:**
+  - Um `.so` por commit do Envoy
+  - Plugins isolados pelo SDK próprio do N3X
+  - CI testando o `.so` atual na próxima versão candidata do Envoy
+- **Plano de contingência:** manter o alvo anterior até o adaptador ser atualizado
+
+#### Overhead real acima do estimado, sem benchmark público de referência
+- **Probabilidade:** media
+- **Impacto:** as metas de latência (p99 menor ou igual a 2 ms) não são atingidas
+- **Mitigação:**
+  - Benchmark open-loop próprio como portão da CI
+  - Micro-benchmarks exigindo 0 alocações
+  - Filtro único no Envoy
+- **Plano de contingência:** otimizar os caminhos quentes ou rever a meta com base nas medições, antes de fechar a v1
+
+#### Negação gRPC chega ao cliente como sucesso (`grpc-status 0`)
+- **Probabilidade:** alta
+- **Impacto:** uma requisição negada aparece como bem-sucedida, o que é uma falha de segurança
+- **Mitigação:**
+  - A negação do SDK sempre escreve `grpc-status` e `grpc-message`
+  - Teste de integração obrigatório no Envoy e no istio-proxy
+  - Resposta local crua proibida para plugins
+- **Plano de contingência:** a release é bloqueada se o teste falhar
+
+#### Vazamento da credencial de um serviço
+- **Probabilidade:** baixa
+- **Impacto:** alguém se passa por um sidecar e envia dados falsos ao painel; o tráfego não é afetado, porque o controller só observa
+- **Mitigação:**
+  - Segredo cifrado no `n3x.yaml`, com a chave em arquivo montado
+  - TLS 1.3 e só o hash bcrypt no controller
+  - Sessões com TTL de 1 h e login com limite de tentativas
+  - Identidade do sidecar conferida contra o token em toda chamada do core, com conflito de identidade destacado no painel e no log
+- **Plano de contingência:** trocar a credencial, com novo hash no controller e redeploy do serviço; as sessões antigas caem na próxima renovação
+
+#### Plugins em versões diferentes no sidecar e no controller
+- **Probabilidade:** media
+- **Impacto:** telas e dados de plugin inconsistentes no painel
+- **Mitigação:**
+  - Manifesto comparado no registro, com alerta no painel
+  - Protos evoluindo só por adição
+- **Plano de contingência:** refazer o build com a mesma lista de plugins nos dois lados
+
+#### Conexão gRPC dentro do Envoy consome memória ou vaza goroutines
+- **Probabilidade:** media
+- **Impacto:** aumento de latência e de memória no sidecar
+- **Mitigação:**
+  - Uma conexão compartilhada e um buffer limitado
+  - Teste de longa duração com o perfil de vazamento de goroutines do Go
+  - `GOMEMLIMIT`
+- **Plano de contingência:** desligar no `n3x.yaml` o envio de eventos não essenciais
+
+#### Capacidade de uma pessoa só para manter cinco repositórios e a matriz de alvos
+- **Probabilidade:** alta
+- **Impacto:** atrasos, principalmente na manutenção do alvo Istio
+- **Mitigação:**
+  - Escopo enxuto, só com o core
+  - Automação de CI para build e testes por alvo
+- **Plano de contingência:** adiar o alvo `istio-1.31` e entregar primeiro só o `envoy-1.40`
+
+---
+
+### Critérios de aceitação
+Checklist objetivo que define se a feature está pronta.
+
+- Um serviço novo em docker compose (controller, sidecar e aplicação) sobe do zero e aparece registrado no painel em até 30 minutos, seguindo só a documentação e sem alterar o código da aplicação
+- A mesma imagem de sidecar e o mesmo `n3x.yaml` funcionam em Kubernetes e em docker compose na CI, e em ECS num teste manual guiado
+- O sidecar encaminha HTTP/1.1, HTTP/2 e gRPC para aplicações em pelo menos duas linguagens (ex.: Go e Python), e o plugin de exemplo produz o mesmo resultado em todas: adiciona o header e nega o path configurado
+- Uma negação do plugin de exemplo numa chamada gRPC chega ao cliente como `PERMISSION_DENIED`, nunca como `OK`, nos alvos `envoy-1.40` e `istio-1.31`
+- Um panic injetado num plugin não derruba o Envoy: com fail-closed, a resposta é 503 com o `grpc-status` correto; com fail-open, a requisição segue; nos dois casos, o `panics_total` sobe em 1
+- Com o controller desligado, o sidecar sobe, serve tráfego e aplica os plugins sem nenhum erro atribuível ao controller; quando o controller volta, o sidecar reaparece no painel em até 30 s (até cerca de 200 serviços sem `session.hmac_key`)
+- Um `n3x.yaml` inválido (campo ausente, config de plugin inválida ou valor `ENC[...]` que não decifra) impede a subida do container, com mensagem que aponta o campo e sem nenhum segredo no log
+- Num rolling update com tráfego contínuo, nenhuma requisição é cortada dentro do prazo de drenagem
+- O `n3x-plugin build` falha, com o código de erro do cenário, nos casos de plugin incompatível com o SDK, ID duplicado, símbolo ausente no Envoy do alvo, `.so` que não carrega, análise estática reprovada e tentativa de remover o plugin core
+- Dois builds do mesmo Dockerfile em máquinas diferentes geram o mesmo hash no manifesto
+- O painel mostra, para cada sidecar, serviço, instância (nome do pod ou ID do container), alvo, versão do Envoy, plugins e hash da config, e destaca com o diff as instâncias do mesmo serviço com configs diferentes
+- Nenhuma tela do painel permite alterar a config de um sidecar nem criar, desativar, remover ou trocar a senha de usuários, e o usuário de leitura não acessa a lista de usuários (o servidor responde 403)
+- O root e os usuários de leitura vêm só do `n3x.yaml` do controller, com hash bcrypt de custo mínimo 12; um nome duplicado ou igual ao do root impede a subida, e 5 logins inválidos seguidos bloqueiam o acesso por 15 minutos
+- Login, logout e bloqueio do painel aparecem no log JSON operacional do controller, sem nenhum segredo; a auditoria formal fica para a v2
+- A config efetiva chega em JSON canônico, com segredos só como `***:<impressão digital>` ou `***:plain`; uma config com hash que não bate é recusada com `DATA_LOSS` e o painel mantém a última válida, com alerta
+- Com o teto de memória do plugin core estourado, o painel mostra o banner de degradado, os heartbeats seguem aceitos e uma nova versão de config é recusada com `RESOURCE_EXHAUSTED`
+- Um sidecar com credencial inválida é recusado no login com `UNAUTHENTICATED`, assim como qualquer chamada sem sessão válida, as conexões usam TLS 1.3 e um teste automatizado confirma que nenhum segredo aparece em logs, erros ou na config enviada ao controller
+- No benchmark open-loop a 1.000 rps, a latência adicionada pelo sidecar fica em p50 menor ou igual a 0,5 ms e p99 menor ou igual a 2 ms; o sidecar ocioso usa até 100 MB e 0,05 vCPU e fica pronto em até 5 s
+- O controller, com 500 sidecars simulados conectados, roda em 1 vCPU e 512 MB, com o painel em p95 menor que 300 ms
+- Os mesmos plugins geram `.so` para `envoy-1.40` e `istio-1.31`, em amd64 e arm64, e cada imagem carrega o seu `.so` sem erro
+- Um plugin novo, criado com o gerador `n3x-new` a partir do exemplo do SDK seguindo só a documentação, é adicionado via Dockerfile e aparece no painel, com uma página e um cartão em widgets, sem mudar nenhum repositório do core
+- O painel passa numa verificação automatizada de acessibilidade, sem violações de nível WCAG AA
+
+---
+
+### Testes e validação
+
+Tipos de teste obrigatórios
+- Testes unitários dos plugins e do core com o kit de testes do SDK: `go test -race`, fuzzing nos parsers (`n3x.yaml` e headers) e benchmarks com `-benchmem` exigindo 0 alocações nos caminhos comuns
+- Testes unitários do controller: host falso de plugins, gRPC em memória, testes HTTP das telas e permissões do painel, testes do mascaramento de segredos, do JSON canônico e do hash da config, e testes do teto de memória e do estado degradado do plugin core
+- Testes de conformidade do SDK por alvo: os mesmos cenários (seguir, parar, retomar, negar e panic) contra `envoy-1.40` e `istio-1.31`, em proxies reais
+- Testes de integração com o Envoy real, na imagem exata de cada alvo e arquitetura: casos golden em HTTP/1.1, HTTP/2 e gRPC (incluindo a negação gRPC), injeção de panic, controller desligado e religado, `n3x.yaml` inválido e drenagem com tráfego
+- Testes de build: cada cenário de falha do `n3x-plugin build`, carga do `.so` em cada imagem, teste negativo com um `.so` feito para um Envoy mais novo carregado num mais antigo, checagem de reprodutibilidade (dois builds, mesmo hash) em amd64 e arm64, corpus de plugins "maliciosos" na análise estática, e bootstrap gerado comparado com arquivos golden e validado com `envoy --mode validate`
+- Testes de compatibilidade de protos com `buf breaking` em todo PR dos plugins
+- Testes de segurança: credencial inválida, sessão inválida ou expirada, limite de tentativas no login, TLS 1.3, CSRF, sessão, bloqueio de login, permissões de root e leitura, busca automatizada de segredos em logs, erros e config enviada, `govulncheck` e `gosec`
+- Testes de carga e desempenho: benchmark open-loop abaixo do joelho da curva (wrk2, Nighthawk ou ghz, com histogramas HdrHistogram) para o sidecar e 500 sidecars simulados para o controller, rodando à noite numa máquina dedicada
+- Testes de longa duração: várias horas com o perfil de vazamento de goroutines do Go e core dump em caso de erro fatal
+- Testes por ambiente: Kubernetes (kind), Kubernetes com Istio e docker compose na CI; ECS em teste manual guiado
+- Testes de acessibilidade: verificação automatizada (axe) nas telas do painel
+
+Estratégia de validação
+- TDD para o core do `.so` (executor da cadeia, contenção de falhas e negação gRPC) e para o pipeline do `n3x-plugin build`; CI como portão, com testes de unidade, conformidade, integração, build e segurança obrigatórios em todo PR e testes de carga e de longa duração à noite e antes de cada release; roteiro manual guiado para os critérios de serviço novo em 30 minutos, ECS e plugin novo criado só com a documentação; validação exploratória do painel com 500 sidecars simulados
