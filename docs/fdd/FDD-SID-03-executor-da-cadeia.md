@@ -1,0 +1,1346 @@
+### FDD: Executor da cadeia de plugins (SID-03)
+
+Versão: 1.0
+Data: 2026-10-20
+Responsável: Guilherme Giusti
+
+---
+
+### 1. Contexto e motivação técnica
+
+**Problema técnico.** O N3X troca a iteração de filtros do Envoy por um único filtro que itera os plugins dentro do Go (PRD, "Decisões e trade-offs"). As duas pontas já estão especificadas: o adaptador do alvo (FDD 16) transforma cada evento do Envoy num cruzamento para a cadeia inteira, e a lógica pura da cadeia (fases, grupos por `order`, recortes, isolamento, aplicação das mudanças, escolha da negação e efeito da política) mora no pacote público `chain` do SDK (FDD 07, L-50). Falta especificar, de forma verificável, a peça do `.so` que liga as duas pontas:
+
+- **Subida:** quem lê o `n3x.yaml` dentro do `.so`, de onde vêm os manifestos e os schemas (o `.so` real tem a seção `.n3x_manifest`; o harness de desenvolvimento não tem, L-35), como cada instância é criada uma vez sob `recover`, como memória, métricas e tarefas são seladas e quando as tarefas começam
+- **Entrada do `.so`:** qual função o `main` gerado pelo `n3x-plugin build` chama, como o plugin core e cada `agent.Plugin()` são registrados e quais símbolos o Envoy procura (L-03). O HLD do controller fixa `host.Run(core.Plugin(), ...)`; o do sidecar não tem equivalente, e em `-buildmode=c-shared` a função `main` nem roda (I-07 da FDD 16)
+- **Requisição:** como cada cruzamento do adaptador vira passos do `chain.Exchange` e vereditos (`Continue`, `Pause`, `NeedBody`, `Replied`) sem alocar
+- **Grupo paralelo:** como as funções do `Go()` devolvem o resultado ao `Exchange`, cancelam as instâncias posteriores e retomam a requisição pelo agendador sem tocar uma requisição encerrada nem um estado já reaproveitado
+- **Casos de borda:** hooks de response depois de uma negação, ordem e prazo do `OnComplete`, body em grupo, rota, cliente que desconecta e o processo do `envoy --mode validate` (FDD 26)
+
+Um erro aqui prende requisições, perde mudanças de header ou deixa uma negação gRPC sair como sucesso (riscos do PRD "Bugs ao reimplementar a iteração de filtros do Envoy dentro do core" e "negação gRPC").
+
+**Encaixe no HLD.** Esta FDD especifica a linha "Executor da cadeia (`core/chain`)" de "Componentes e responsabilidades" do HLD do `n3x-sidecar`, as entidades "Cadeia compilada" e "Estado por requisição" do "Modelo de dados" e a parte do "Fluxo de requisição" que roda no Go. Ela cria três pacotes no módulo `github.com/giustech/n3x-sidecar/core` e um diretório de desenvolvimento:
+
+- `core/chain`: o executor. Implementa `adapter.Factory` e `adapter.Chain` (FDD 16) usando o `chain` do SDK como motor; declara as portas que as FDDs 18, 38 e 09 implementam (contrato 9); não importa o SDK do Envoy nem `core/adapter/active`
+- `core/entry`: raiz de composição e API consumida pelo código gerado (L-03). Liga o executor às peças de produção (fonte do manifesto da FDD 22, `core/fault` da FDD 18, `core/grpcconn` da FDD 38) e ao adaptador do alvo compilado (`active.Register`)
+- `core/chain/chaintest`: apoio de teste do executor (harness de conformidade, `Host` falso, contenção de referência e plugin core mínimo)
+- `cmd/libn3x-dev` (tag `n3x_dev`) e `dev/`: harness de desenvolvimento do `.so` sem builder (L-35)
+
+Como o SDK também tem um pacote `chain`, o código do sidecar importa o do SDK com o nome `sdkchain` (convenção desta FDD).
+
+Consumidores:
+
+- FDD 18 (SID-04): implementa a porta `Containment` (disjuntor, `max_inflight`, prazo e `recover` do `Go()`, zumbis, `Background`, `Dial`, `HTTPClient`) e roda a conformidade com o harness desta FDD
+- FDD 21 (BLD-03): gera o `main` com `entry.Register` (contrato 1)
+- FDD 22 (BLD-04): entrega o leitor da seção `.n3x_manifest` que vira a fonte de produção (contrato 4)
+- FDD 38 (SID-10): implementa a porta `ControllerProvider` e instala os interceptors do core na conexão compartilhada
+- FDDs 25 e 29: preenchem a identidade, a drenagem e o `ExitContext` da visão `proxy.Sidecar` que o executor monta (FDD 09)
+- FDD 36 (CORE-01): metade de proxy do core com config vazia e `ConnInterceptors` (FDD 09)
+- FDDs 48, 49 e 50: conformidade cruzada, alvo `istio-1.31` e benchmark
+
+**Atores.** Adaptador do alvo (chama a fábrica e os hooks de requisição), instâncias de plugin (recebem `Stream`, `RouteStream` e `Env`), `core/config` (lê e valida o `n3x.yaml`, FDD 15), telemetria do `.so` (FDD 16), contenção de falhas (FDD 18), conexão compartilhada (FDD 38), builder (gera o `main` com o ID e o módulo de cada plugin, FDD 21), plugin core (metade só de fundo, a única que recebe `proxy.CoreEnv`, FDD 09) e operador (lê logs de subida e métricas).
+
+**Limites.**
+- O executor não fala com o SDK do Envoy, não escreve no fio e não decide o formato da negação: devolve vereditos e chama `Request.Reply` (FDD 16)
+- O executor não reimplementa regra da cadeia: ordem, grupos, recortes, isolamento, efeito da política e escolha da negação são do `chain` do SDK (FDD 07)
+- O executor não implementa disjuntor, `max_inflight`, prazo nem `recover` das funções do `Go()`: chama a porta `Containment` (FDD 18)
+- O executor não lê o `.so` nem a seção ELF: recebe uma `SourceFunc` (FDD 22 em produção)
+- O executor não valida o `n3x.yaml` por conta própria: usa `config.Load` (FDD 15)
+
+**Suposições**
+- O adaptador chama os hooks de uma requisição em série no mesmo worker, nunca ao mesmo tempo, e chama `OnComplete` exatamente uma vez (FDD 16, contrato 3)
+- O bootstrap tem uma única ocorrência do filtro `n3x`, então `Build` roda uma vez por processo (FDD 16, L-45; FDD 26)
+- O `chain` do SDK está na série `v0.x` e aceita os refinos do contrato 10 (FDD 07, contrato 9: "as assinaturas podem ser refinadas pela FDD 17")
+- Todos os plugins do `.so`, o `core/` e o plugin core usam a mesma versão do SDK (L-57, FDD 20)
+- O builder grava o caminho do módulo de cada plugin no registro gerado e em `plugins[].module` do manifesto embutido (FDDs 09, 21 e 22)
+- Go 1.26 com cgo e `-buildmode=c-shared` (ADR-008 do `n3x-sidecar`)
+
+**Restrições**
+- 0 alocações por requisição no executor, nos recortes e na negação; até 5 cruzamentos com trabalho de cadeia no cenário de referência, independentemente do número de plugins (ADR-009 do `n3x-sidecar`)
+- Instâncias criadas uma vez na subida e imutáveis; estado só por requisição (PRD, riscos)
+- Nenhuma operação sem prazo (ADR-006 do `n3x-sidecar`)
+- Plugins registrados por função gerada, sem `init()` (HLD do `n3x-sdk`; premissa do ASSUNTO)
+- Nada vem de variável de ambiente do operador (FR-001); o marcador `N3X_ENVOY_VALIDATE` é sinal interno (FDD 26)
+- Logs nunca registram path, header, query, body, mensagem de negação ou segredo (HLD do `n3x-sidecar`)
+- Documentação e mensagens em pt-BR; identificadores, campos e comandos em inglês
+
+**Rastreabilidade**
+- PRD 1.5: FR-004 (instâncias criadas uma vez, oito fases, ordem inversa na resposta, seguir, negar, assíncrono e retomar, todos notificados no fim, recorte sem custo, config inválida ou plugin ausente recusa a subida); FR-003 (gRPC como `/pacote.Serviço/Método`, `grpc-status` correto); FR-012 (só fases até `route` alteram a rota; body; capacidade ausente informada); FR-015 (registro gerado e `.so` único); desempenho (0 alocações, até 5 cruzamentos, p50 de 0,5 ms e p99 de 2 ms no total); "Testes e validação" (TDD no core, conformidade por alvo, propriedade e fuzzing); critério de aceite "negação gRPC do exemplo chega como `PERMISSION_DENIED`, nunca `OK`"
+- ADRs do `n3x-sidecar`: ADR-001 (core como biblioteca, `.so` só pelo builder), ADR-004 (disjuntor, ponto de encaixe), ADR-005 (grupo paralelo), ADR-006 (prazos), ADR-007 (o `.so` lê o próprio `n3x.yaml`), ADR-009 (orçamento)
+- ADRs do `n3x-sdk`: ADR-004 e ADR-019 (capacidades privilegiadas do core), ADR-015 (hooks opcionais, `agent.Plugin()` sem efeito colateral, uma instância por `instance`), ADR-016 (`Go()` e tarefas de fundo), ADR-017 (memória com cota), ADR-022 (métricas por plugin); ADR-008 do `n3x-plugin-core` (core sem fase)
+- Lacunas do README:
+  - **L-03 fechada aqui:** o `main` gerado importa só `core/entry`, o plugin core e os `agent/` escolhidos e faz uma única chamada `entry.Register(entry.Core("<módulo>", core.Plugin()), entry.Plugin("<id>", "<módulo>", agent.Plugin())...)` num inicializador de variável de pacote; `func main() {}` fica vazio. O módulo de cada plugin vai no registro porque a origem das capacidades privilegiadas é o par (ID, módulo) gravado pelo builder (FDD 09). O código gerado não exporta símbolo: os símbolos do ABI vêm do SDK Go do Envoy importado pelo adaptador (contrato 1). A FDD 21 só gera
+  - **L-35 fechada aqui na parte do sidecar:** o harness de desenvolvimento do `.so` (`cmd/libn3x-dev`) compila com a tag `n3x_dev` e chama `entry.RegisterDev`, que monta um `config.NewStaticSource` a partir do próprio registro (schema de `ConfigSchema()`) e de cópias dos `n3x-plugin.yaml` embutidas com `go:embed`; ele roda o Envoy direto, sem `n3x run`, cujo pré-voo recusa `.so` sem manifesto (contrato 4)
+  - **L-50 aplicada (FDD 07):** o executor importa `github.com/giustech/n3x-sdk/chain` como motor e implementa o `conformance.Harness` do sidecar (contratos 6, 7 e 11), com os refinos do contrato 10
+  - **L-10 aplicada (FDD 09, contrato 4):** uma instância da metade de proxy do core por processo, `proxy.CoreInstance` (`core`), criada pelo executor antes de `plugins[]`, com config `{}`, também no modo standalone (onde fica inativa); a metade só de fundo é exclusiva do core na v1 e hook nela recusa a subida (`background_only_hooks`) (contratos 3 e 5)
+  - **L-01 e L-07 aplicadas (FDD 09), parte do executor:** o executor confere a origem com `proxy.CheckPrivileged`, monta o `proxy.CoreEnv` e a visão `proxy.Sidecar` do core, calcula o `proxy.ConfigInput`, cria a `proxy.EventQueue` e produz os eventos `config_error` e `secret_in_clear` da subida; identidade, drenagem e saída entram por portas das FDDs 25, 29 e 38 (contratos 5 e 9)
+  - **L-20 e L-49 aplicadas (FDD 05):** `SetRoute` reescreve `:path` e `:authority` e só existe com `route_change`; no `envoy-1.40` as duas capacidades opcionais existem (FDD 16)
+  - **L-45 respeitada (FDD 16):** `Build`, `Start` e `Stop` rodam no máximo uma vez por processo; o executor não guarda estado global além do que a fábrica recebe
+- Pedidos de FDDs anteriores atendidos:
+  - FDD 04: `memory.Runtime` por processo, conta por plugin (sempre para o `n3x.core`), escopo por instância, `New` sob `recover`, `Seal` com `defer`, `Run` no `Start` e logs `memory_quota` e `memory_oversize` (contrato 5; seção 7)
+  - FDD 05: `RouteStream` por tipo, isolamento do grupo, ordem estrita e `OnComplete` para todo o recorte, todos via `chain`; logs `plugin_hooks`, `hook_unsupported`, `plugin_without_hooks`, `hook_violation`, `route_conflict` e `invalid_deny` (contratos 6 e 7; seção 7)
+  - FDD 06: `Env` montado por instância, selo de métricas, memória e tarefas depois do `New`, tarefas iniciadas uma vez no `Start` e log `plugin_limits` (contrato 5)
+  - FDD 07: `chain` como motor, `Harness` do sidecar, 0 alocações e p50 de 0,05 ms (contratos 6, 11; seção 9); no ajuste pós-FDD 09 (P-14 dela), `conformance.RunCore` com o harness do sidecar e com o core real, e a decisão de uma função pura do SDK para o `PluginConfig` (`proxy.NewPluginConfig`, contrato 10)
+  - FDD 15: `config.Load` com `SecretsOpen`, `VerifyRegistry`, `Report` logado, fonte do harness sem ELF, semântica dos recortes e log `route_conflict` (contratos 3, 4 e 8)
+  - FDD 16: `Factory` e `Chain` implementados, `active.Register` na inicialização do `main` (via `entry`), cadeia inerte em `ModeValidate`, `r.IsGRPC()`, coletores de memória, `Configure` e `SetSecretsInClear` (contratos 1, 3 e 6)
+  - FDD 26: config do filtro inerte na validação, sem `New`, tarefas, `Stop` nem controller (contrato 3)
+  - FDD 09: instância única do core, `CoreEnv` com `Sidecar()`, `ConfigInput`, eventos da subida pela `EventQueue` e `CheckPrivileged` com o par (ID, módulo) do registro gerado, conferido com `plugins[].module` do manifesto embutido (contratos 1, 3, 5 e 9)
+
+---
+
+### 2. Objetivos técnicos
+
+- **Mesmas regras do kit, por construção.** Invariante: toda decisão de cadeia sai de `sdkchain.Exchange`; o executor não tem algoritmo de fase, grupo, recorte, isolamento ou negação. Medida: `conformance.RunChain` (no mínimo 30 casos) passa com o harness do sidecar; teste diferencial com 1.000 casos aleatórios por PR (100.000 na CI noturna) dá o mesmo `Outcome` no harness do kit e no do sidecar (hipótese de volumes).
+- **0 alocações no caminho comum.** Medida: `testing.AllocsPerRun(1000, ...)` dá 0, com a ponte falsa do `adaptertest`, para a requisição completa (headers, response e fim) da config de referência em HTTP e gRPC, para a negação na request e na response, para a instância fora do recorte e para o hook de body com buffer do pool.
+- **Custo do executor dentro do orçamento.** Medida: no micro-benchmark com a ponte falsa, a requisição completa da config de referência (core sem hooks e exemplo com `OnRequestHeaders`) custa até 3 µs no p50 (hipótese); na máquina do benchmark da FDD 50, executor mais plugins síncronos de referência acrescentam até 0,05 ms no p50 e 0,10 ms no p99 sobre a medida "adaptador mais cadeia vazia" da FDD 16 (ADR-009).
+- **Recorte sem custo.** Medida: 50 instâncias fora do recorte acrescentam até 1 µs por requisição (até 20 ns por instância, hipótese), 0 alocações e 0 chamadas a plugin.
+- **Cruzamentos independentes do número de plugins.** Invariante: o executor devolve no máximo um veredito por evento do adaptador e pede no máximo uma retomada por grupo com `Go()`. Medida: `n3x_sidecar_entries_total{kind="chain"}` por requisição é 3 na config de referência e 5 com body num pedaço e um grupo com `Go()`, igual com 1 e com 50 instâncias.
+- **Toda requisição termina e nada toca estado reaproveitado.** Invariante: nenhum resultado de `Go()` chega ao `Exchange` depois do fim da requisição ou depois de o estado voltar à lista livre. Medida: fuzzing de 10 minutos com desconexão aleatória durante `Go()` e corpo pendente: 0 crash, 0 entrega depois do fim, estados em uso voltam a 0; teste com `-race` de 1.000.000 de entregas concorrentes com `OnComplete`.
+- **`OnComplete` exatamente uma vez por instância do recorte.** Invariante: toda instância cujo recorte casa com a requisição e que implementa o hook recebe `OnComplete` uma vez, inclusive depois de negação, falha ou desconexão; nenhuma outra recebe. Medida: teste de propriedade sobre o corpus do fuzzing.
+- **Subida previsível e completa.** Medida: `Build` da config de referência em até 50 ms no p99 e `Build` em `ModeValidate` em até 50 ms (hipóteses, a segunda vem da FDD 16); todo erro de subida sai com caminho e regra estáveis (contrato 3); nenhuma tarefa de fundo roda numa subida que falhou.
+- **Nenhuma capacidade privilegiada fora do core no `.so`.** Invariante: só a instância `core` de `n3x.core` com módulo de `plugin.IsCoreOrigin` recebe `proxy.CoreEnv`; toda recusa da FDD 09 impede a subida. Medida: os vetores de recusa da seção 9 da FDD 09 do lado do sidecar (`conn_interceptors`, `background_only`, core fingido, core sem interceptor, core com hook, módulo diferente do manifesto) saem com o mesmo `Path` e a mesma `Rule` no executor e no kit; `env.(proxy.CoreEnv)` é falso para todas as outras instâncias.
+- **Contrato do `main` gerado estável.** Medida: o `main` de referência da FDD 21 (golden versionado em `core/entry/testdata`) compila com `-buildmode=c-shared -tags n3x_envoy140` em toda CI do `n3x-sidecar`; mudança que quebra o golden reprova o PR.
+
+---
+
+### 3. Escopo e exclusões
+
+**Incluído**
+- Contrato do `main` gerado (L-03): pacote `core/entry` com `Register`, `Core`, `Plugin` e `Registration`; forma do código gerado; regra dos símbolos; o que fica com o adaptador
+- Registro do `.so` (`chain.Registry`) e as regras de geração conferidas na subida
+- Implementação de `adapter.Factory` (`chain.NewFactory`) e de `adapter.Chain`, incluindo a cadeia inerte de `ModeValidate`
+- Subida dentro do `.so`: fonte dos manifestos e schemas, `VerifyRegistry`, `config.Load` com `SecretsOpen`, `Configure` da telemetria, `Report` logado, contas e escopos de memória, montagem do `proxy.Env` (`Instance` e `Memory` aqui; demais partes pelas portas), `Instantiate` sob `recover` e com prazo, selo, `HooksOf`, compilação com `sdkchain.Compile` e logs de subida
+- Lado do executor da FDD 09: conferência do módulo do registro contra o manifesto, `proxy.CheckPrivileged` antes e depois do `New`, instância única do core (L-10), montagem do `proxy.CoreEnv` e da visão `proxy.Sidecar`, cálculo do `proxy.ConfigInput` (L-07), criação da `proxy.EventQueue`, eventos `config_error` e `secret_in_clear` da subida e entrega dos `ConnInterceptors` à porta da conexão
+- Fonte dos manifestos no `.so` (`SourceFunc`): ELF da FDD 22 em produção, stub até ela, estática nos testes e no harness de desenvolvimento
+- Harness de desenvolvimento do `.so` sem builder (L-35): `entry.RegisterDev` com a tag `n3x_dev`, `cmd/libn3x-dev` e `dev/` com Envoy 1.40 em docker compose
+- Execução por requisição: mapeamento de cada cruzamento para os passos do `Exchange` e para vereditos, `Stream` e `RouteStream` do sidecar (visões do `Exchange` sobre o `adapter.HeaderMap`), negação via `Reply`, rota via `RouteChanged`, body via `NeedBody`
+- Grupo paralelo e `Go()`: tabela de funções por requisição, entrega de resultados sob trava, cancelamento dos posteriores, retomada pelo agendador, desconexão e excesso (`max_inflight`, aplicado pela FDD 18)
+- Estado por requisição em lista livre própria, com geração
+- Aplicação da semântica dos recortes da FDD 15
+- Portas para as FDDs 18, 38 e 09 (contrato 9) e os refinos pedidos ao `chain` do SDK (contrato 10)
+- Harness de conformidade do sidecar (`chaintest.Harness`) e testes golden em Envoy real com o harness de desenvolvimento
+- Métricas `n3x_plugin_duration_seconds` (hooks síncronos), `n3x_plugin_denies_total`, as três de memória (coletor), `n3x_config_secrets_in_clear` e a nova `n3x_sidecar_chain_inflight`; logs de subida e de requisição
+
+**Excluído**
+- Tradução para o SDK Go do Envoy, resposta local crua, escrita da negação no fio, recálculo de rota no Envoy e processo único: FDD 16 (SID-02)
+- `recover` e prazo das funções do `Go()`, aplicação das políticas de falha fora do `chain`, `max_inflight`, zumbis, disjuntor, amostragem de stack, métricas `n3x_plugin_failures_total`, `n3x_plugin_panics_total`, `n3x_plugin_async_*` e `n3x_plugin_breaker_open`, e eventos de falha ao plugin core: FDD 18 (SID-04)
+- Implementação de `env.Background`, `env.Dial`, `env.HTTPClient` e `proxy.Sleep` no sidecar: FDD 18 (SID-04); `env.Controller()`: FDD 38 (SID-10)
+- Geração do `main.go`, do registro e da compilação: FDD 21 (BLD-03), que aplica o contrato 1
+- Leitor da seção `.n3x_manifest` e hash de integridade: FDD 22 (BLD-04)
+- Pré-voo da subida no entrypoint (alvo, integridade, versão do `core/`): FDD 25 (SID-05)
+- Lógica pura da cadeia (`Compile`, `Exchange`, `Effect`, `Render`) e suítes de conformidade: FDD 07 (SDK-07); aqui só os refinos do contrato 10
+- Contrato das capacidades privilegiadas (`CheckPrivileged`, `CoreEnv`, `Sidecar`, `ConfigInput`, `EventQueue`, `ConnInterceptorProvider`): FDD 09 (SDK-09); aqui só a orquestração no `.so`
+- Identidade da instância do sidecar e bytes do manifesto: FDD 25 (SID-05) com o leitor da FDD 22; `Draining` e evento `drain_start`: FDD 29 (SID-09); instalação dos interceptors, conexão viva na janela de saída e `ExitContext`: FDD 38 (SID-10); eventos `panic`, `breaker_open` e `plugin_disabled`: FDD 18; publicação das métricas de eventos e de sessão: FDD 16; formato da config efetiva e mascaramento: FDD 37 (CORE-02)
+- Comportamento do plugin core (tarefas, sessão, registro, heartbeat): FDDs 36, 39 e 42
+- Canal de controle e drenagem: FDD 29 (SID-09); bootstrap: FDD 26 (SID-06)
+- Alvo `istio-1.31`: FDD 49 (SID-11); benchmark open-loop como portão: FDD 50 (SID-12)
+- `OnResponseBody` e rota no `Result` assíncrono: fora da v1 (ADR-015 do `n3x-sdk`; FDD 05)
+
+---
+
+### 4. Fluxos detalhados e diagramas
+
+**Fluxo de carga do `.so`** (inicialização do pacote `main` gerado, antes da primeira criação da config do filtro)
+1. O Envoy abre `/usr/lib/n3x/libn3x.so`; o runtime Go inicializa os pacotes importados (SDK, `core/`, plugin core e plugins, todos sem efeito colateral) e depois o pacote `main`.
+2. O inicializador da variável de pacote do `main` gerado chama `entry.Register(entry.Core("<módulo>", ...), entry.Plugin("<id>", "<módulo>", ...)...)`.
+3. `entry.Register` monta o `chain.Registry` (ordena por ID e confere as regras do contrato 3, linhas 1 a 7) sem panic e sem I/O; erro fica guardado.
+4. `entry.Register` cria a fábrica `chain.NewFactory(reg, opts)` com as peças de produção (fonte do manifesto da FDD 22, `core/fault`, `core/grpcconn`, partes da visão `Sidecar` das FDDs 25 e 29) e chama `active.Register(fábrica)` (FDD 16); se o registro tinha erro, a fábrica devolve esse erro no `Build`.
+
+**Fluxo principal de subida: `Build` em `ModeServe`** (thread principal do Envoy, uma vez por processo, sob o `recover` do adaptador)
+1. Confere o registro (erro guardado vira problema `registry_*`).
+2. Chama `opts.Source(host, reg)`: em produção, o leitor da FDD 22 sobre o próprio arquivo do `.so` (contrato 4), que devolve os schemas, os módulos (`plugins[].module`) e os bytes do manifesto.
+3. `config.VerifyRegistry(src.Schemas, reg.ConfigRegistered())`: IDs com metade de proxy e schemas byte a byte (FDD 15).
+4. Origem (FDD 09, contratos 1 e 2): para cada plugin do registro, o módulo gravado pelo builder precisa ser igual a `plugins[].module` do manifesto (`privileged_origin` em `module`); para cada plugin do manifesto com metade de proxy, `proxy.CheckPrivileged(id, módulo, manifesto, nil)` (metade só de fundo fora do core dá `privileged_capability`; `n3x.core` de outro módulo dá `privileged_origin`). Todos os problemas numa passada.
+5. `config.Load(Options{Path: host.FilterConfig().ConfigPath, Source: src.Schemas, Secrets: SecretsOpen})`. Em erro, loga um `config_problem` por problema e um `config_rejected` e devolve o erro.
+6. `host.Telemetry().Configure(service, nível de runtime.log_level)`; loga um `config_warning` por aviso do `Report` e o `config_loaded`; `Platform().SetSecretsInClear(rep.SecretsInClear)`.
+7. Monta o `proxy.ConfigInput` (contrato 5) e, com a seção `controller`, cria a `proxy.EventQueue` (`proxy.MaxPendingEvents`) e empurra um `config_error` por aviso não fatal do `Report` (menos `secret_in_clear`) e um `secret_in_clear` por segredo em claro (FDD 09, contrato 7); registra o coletor das métricas de eventos. No standalone, não há fila.
+8. Cria o `memory.Runtime` do processo com `DefaultMaxBytes: memory.DefaultProxyMaxBytes`.
+9. Monta a lista de instâncias: primeiro a do core (`n3x.core`, instância `proxy.CoreInstance`, config `{}`, FDD 09), depois `cfg.Instances` na ordem de `plugins[]`.
+10. Para cada plugin com instância, na ordem da lista: conta de memória (`NewAccount(id, limites)`), coletor de memória na telemetria, `PluginContainment` (FDD 18) e visão do controller (FDD 38); loga `memory_quota` e `plugin_limits`.
+11. Para cada instância, na ordem da lista:
+    - `InstanceTelemetry(id, instance)` (FDD 16), escopo de memória (`acc.NewScope(instance)`), `InstanceContainment` (FDD 18)
+    - monta o `Env` (contrato 5); no core, monta o `proxy.CoreEnv` com a visão `Sidecar()` (FDD 09); para os demais, `env.(proxy.CoreEnv)` é falso
+    - roda `Instantiate(config, env, plugin.WithSecretOpener(cfg.Opener()))` numa goroutine sob `recover`, com prazo de `DefaultInstantiateTimeout` (5 s)
+    - com `defer`, sela métricas, memória e tarefas da instância
+    - erro, `(nil, nil)`, panic ou prazo: loga `instance_failed` e a subida para aqui (hipótese H-14)
+    - `proxy.CheckPrivileged(id, módulo, manifesto, inst)`: no core, confere o pacote do tipo dinâmico, `ConnInterceptorProvider` e ausência de hooks (`background_only_hooks`); nos demais, recusa `ConnInterceptorProvider`. Recusa loga um `privileged_refused` por problema e para a subida
+    - no core, com a seção `controller`: chama `ConnInterceptors()` uma vez sob `recover`, confere os dois valores não nulos (`core_capability_missing`) e entrega à porta da FDD 38; loga `privileged_granted`
+    - `proxy.HooksOf(inst)`, `Platform().Instance(id, instance, fase, hooks)` e `ic.Seal(métricas)`; loga `plugin_hooks`
+12. `sdkchain.Compile(specs das instâncias com fase, Options{Target, MaxRequestBody})`; loga um `hook_unsupported` ou `plugin_without_hooks` por aviso e um `chain_compiled` com o layout por fase e grupo.
+13. Prepara a lista livre de estados por requisição e devolve a `Chain`.
+14. O adaptador define as stats e chama `Chain.Start()` (FDD 16), que só dispara goroutines: `memory.Runtime.Run`, `Containment.Start()` (tarefas de fundo, na ordem de registro, as do core primeiro) e `ControllerProvider.Start()`.
+
+**Fluxo de subida em `ModeValidate`** (processo do `envoy --mode validate`, com `N3X_ENVOY_VALIDATE=1`)
+1. Passos 1 a 5 do fluxo principal (registro, fonte, `VerifyRegistry`, origem pelo manifesto), mas `config.Load` com `SecretsVerify`: nenhum valor aberto vira texto.
+2. `Configure` da telemetria (só para o campo `service` dos logs).
+3. Sem `ConfigInput`, fila de eventos, memória, contas, `New`, `Compile`, tarefas ou controller; devolve uma cadeia inerte e loga `chain_validated`.
+
+**Fluxo principal de requisição: config de referência, sem body de hook e sem `Go()`**
+1. `OnRequestHeaders(r, eos)` (cruzamento 1): pega um estado da lista livre (geração nova), guarda em `r.SetValue`, chama `x.Reset(st, r.Headers(), !eos, r.IsGRPC())` e entra no laço de condução: `x.Run()` roda os hooks síncronos das fases de request e devolve `StepForward`; se `x.RouteChanged()`, chama `r.RouteChanged()`; devolve `Continue`.
+2. `OnResponseHeaders(r, eos)` (cruzamento 4): `x.Response(r.Status(), r.ResponseHeaders())`; o laço roda os hooks de response em ordem inversa de fases e de grupos e devolve `StepResponseDone`; devolve `Continue`.
+3. `OnComplete(r)` (cruzamento 5): `x.Complete()` chama `OnComplete` de toda instância do recorte que implementa o hook; o estado avança de geração e volta à lista livre.
+
+**Laço de condução** (o mesmo em todo cruzamento; contrato 6)
+
+| Passo devolvido por `x.Run()` | Veredito ao adaptador | O que o executor faz antes |
+| --- | --- | --- |
+| `StepAsync` | `Pause` (ou segue no laço se nenhuma função ficou pendente) | `r.NewToken()`; inicia cada função do grupo pela porta `Launch` (contrato 7) |
+| `StepBody` | `NeedBody` | Nada; o body chega em `OnRequestBody` |
+| `StepForward` | `Continue` | `r.RouteChanged()` se `x.RouteChanged()` |
+| `StepRespond` | `Replied` | `r.Reply(x.Deny())`; conta a negação vencedora e loga `request_denied` amostrado |
+| `StepResponseDone` | `Continue` | Nada |
+
+**Fluxos alternativos e exceções**
+- **Negação na request:** `StepRespond`; o adaptador escreve a resposta local e não chama `OnResponseHeaders` para ela (FDD 05, FDD 16). As instâncias que rodaram não recebem hook de response; recebem só `OnComplete`, com `Status()` igual ao status HTTP nominal da negação, também em gRPC (hipótese H-10).
+- **Negação na response:** `StepRespond` dentro de `OnResponseHeaders` ou `OnResume`; o adaptador troca a resposta da aplicação; as fases de response seguintes não rodam.
+- **Resposta gerada pelo Envoy depois do encaminhamento** (503 sem aplicação, 504 de prazo): passa pelos hooks de response como qualquer resposta (FDD 05).
+- **Body de hook:** `StepBody` vira `NeedBody`; `OnRequestBody(r, b)` chama `x.SetBody(b.Data)` ou, com `b.OverLimit`, `x.SetBodyOverLimit(b.Size)` (contrato 10) e volta ao laço. O body cruza uma vez por requisição e o mesmo buffer (do adaptador, válido até `filter_destroy`) é entregue a toda instância com hook de body, de todos os grupos e fases.
+- **`Go()`:** `StepAsync`; o executor inicia as funções e devolve `Pause`; os resultados chegam ao `Exchange` sob trava, de qualquer goroutine; quando a última função do grupo resolve, a goroutine chama `r.Schedule(token)`; em `OnResume(r, t)` o laço continua (contrato 7).
+- **`SetRoute`:** em `access`, `authn` e `route`, o `Exchange` grava `:path` e `:authority` no `HeaderMap` no fim do grupo e marca `RouteChanged`; o executor chama `r.RouteChanged()` antes de devolver `Continue`; as fases seguintes e os recortes delas veem a rota nova.
+- **Cliente desconecta com `Go()` pendente:** o adaptador chama `OnComplete`; o executor marca a requisição como encerrada sob a trava, chama `x.Disconnect()`, cancela o `ctx` das funções pendentes, chama `x.Complete()` (com `Status()` 0) e devolve o estado; resultados que chegarem depois são descartados pela geração.
+- **Excesso de trabalhos (`max_inflight`):** `Launch` devolve falso sem abrir goroutine; o executor chama `x.Abort(i, CauseOverflow, nil)` na hora; a política sai do `chain` (FDD 18 decide o que conta).
+- **Disjuntor aberto:** `Guard.Before` devolve `SkipBreaker` (porta da FDD 18); o `chain` aplica a política sem chamar o plugin; a instância não recebe nenhum hook, nem `OnComplete` (hipótese H-11).
+- **Panic em hook síncrono:** o `chain` contém e chama `Guard.Panicked` (que repassa à FDD 18) e aplica a política; em `OnComplete`, só conta.
+- **Bug do executor** (panic fora do `recover` do `chain`, veredito inválido): a rede de proteção do adaptador responde `500` ou `INTERNAL` e conta em `n3x_sidecar_core_errors_total` (FDD 16).
+
+**Diagramas**
+
+Carga, registro e subida (L-03 e L-45):
+
+```mermaid
+sequenceDiagram
+    participant E as Envoy, thread principal
+    participant M as main gerado
+    participant N as core/entry
+    participant A as adaptador (active)
+    participant X as core/chain (fábrica)
+    participant C as core/config
+    participant S as fonte (FDD 22)
+    participant P as plugins
+    E->>M: dlopen e inicialização dos pacotes
+    M->>N: Register(Core(módulo, core.Plugin()), Plugin("n3x.example", módulo, ...))
+    N->>X: NewRegistry e NewFactory (sem panic, sem I/O)
+    N->>A: active.Register(fábrica)
+    E->>A: config_new(n3x, filter_config)
+    A->>X: Build(host)
+    X->>S: Source(host, registro): schemas, módulos, manifesto
+    X->>C: VerifyRegistry
+    X->>X: módulos contra o manifesto e CheckPrivileged(manifesto, nil)
+    X->>C: Load(SecretsOpen)
+    X->>X: Configure, Report, ConfigInput, EventQueue, memory.Runtime, contas
+    loop instância (core primeiro, depois plugins[])
+        X->>P: Instantiate(config, env ou CoreEnv) sob recover, prazo 5 s
+        X->>X: sela; CheckPrivileged(instância); no core, ConnInterceptors; HooksOf
+    end
+    X->>X: sdkchain.Compile e chain_compiled
+    X-->>A: Chain
+    A->>X: Start (memória, tarefas, controller)
+```
+
+Requisição com um grupo de duas instâncias com `Go()`:
+
+```mermaid
+sequenceDiagram
+    participant A as adaptador
+    participant X as executor
+    participant K as sdkchain.Exchange
+    participant F as Launch (FDD 18)
+    participant G1 as Go() de acl-a
+    participant G2 as Go() de acl-b
+    A->>X: OnRequestHeaders(r, eos)
+    X->>K: Reset(st, headers, hasBody, isGRPC) e Run
+    K-->>X: StepAsync {0, 1}
+    X->>A: NewToken
+    X->>F: Launch(0) e Launch(1)
+    X-->>A: Pause
+    G2-->>X: Done(1, DenyResult)
+    X->>K: Resolve(1) sob trava, nada a cancelar
+    G1-->>X: Done(0, ContinueResult)
+    X->>K: Resolve(0) sob trava, pendentes 0
+    X->>A: Schedule(token)
+    A->>X: OnResume(r, token)
+    X->>K: Run
+    K-->>X: StepRespond (negação de acl-b)
+    X->>A: Reply(Forbidden) e Replied
+    A->>X: OnComplete(r)
+    X->>K: Complete
+```
+
+Estados do estado por requisição no executor:
+
+```mermaid
+stateDiagram-v2
+    state "Livre" as Free
+    state "Rodando no worker" as Run
+    state "Pausada (Go pendente)" as Pause
+    state "Esperando body" as Body
+    state "Respondida" as Rep
+    state "Encerrada" as End
+    [*] --> Free
+    Free --> Run: OnRequestHeaders, geração nova
+    Run --> Pause: StepAsync
+    Run --> Body: StepBody
+    Run --> Rep: StepRespond
+    Run --> Run: StepForward ou StepResponseDone, próximo cruzamento
+    Pause --> Run: última função resolvida, OnResume
+    Body --> Run: OnRequestBody
+    Pause --> End: OnComplete por desconexão
+    Body --> End: OnComplete por desconexão
+    Rep --> End: OnComplete
+    Run --> End: OnComplete
+    End --> Free: geração + 1, volta à lista livre
+```
+
+---
+
+### 5. Contratos públicos (assinaturas, endpoints, headers, exemplos)
+
+**Contrato 1: entrada do `.so` para o `main` gerado (`core/entry`, L-03)**
+- Tipo: sdk (API Go do módulo `github.com/giustech/n3x-sidecar/core`, consumida pelo código gerado da FDD 21)
+- Assinatura/Rota:
+  ```go
+  package entry // github.com/giustech/n3x-sidecar/core/entry
+
+  // Item é um plugin do registro do .so. Valor opaco.
+  type Item struct{ /* ID, módulo, proxy.Plugin, marca de core, erro adiado */ }
+
+  // Core embrulha a metade de proxy do plugin core; ID implícito "n3x.core".
+  // module é o caminho do módulo do core gravado pelo builder. Obrigatório e único.
+  func Core(module string, p proxy.Plugin) Item
+
+  // Plugin embrulha a metade de proxy de um plugin escolhido.
+  // id e module são literais gravados pelo builder (plugins.json e builder.yaml, FDD 21).
+  func Plugin(id, module string, p proxy.Plugin) Item
+
+  // Registration é o resultado do registro; existe para o main gerado usar um inicializador
+  // de variável de pacote (em c-shared, main() não roda) e para testes.
+  type Registration struct{ /* opaco */ }
+
+  func (r Registration) Err() error // erro do registro; o mesmo volta no Build
+
+  // Register guarda o registro, monta a fábrica do executor com as peças de produção
+  // e a entrega ao adaptador do alvo compilado (active.Register, FDD 16).
+  // Nunca faz panic e nunca faz I/O; pode ser chamada uma única vez por processo.
+  func Register(core Item, plugins ...Item) Registration
+  ```
+- Método: n/a (chamada local na inicialização do pacote `main`)
+- Semântica de status/headers:
+  - **Forma do código gerado** (a FDD 21 só gera): `package main`; importa `core/entry`, o pacote `agent` do plugin core e o `agent` de cada plugin com metade de proxy; uma única chamada `entry.Register(...)` atribuída a `var _`; `entry.Core("<módulo do core>", ...)` primeiro; `entry.Plugin("<id>", "<módulo>", ...)` em ordem crescente de ID, com ID e módulo como literais de texto; `func main() {}` vazio. Nenhum `init()`, nenhum `//export`, nenhum outro código. Aliases de import e formatação são da FDD 21 (`go/format`, saída determinística)
+  - **Por que o módulo:** a origem das capacidades privilegiadas é o par (ID, módulo) gravado pelo builder, nunca um valor vindo do código do plugin (FDD 09, contratos 1 e 2). O executor confere o módulo do registro contra `plugins[].module` do manifesto embutido (diferença dá `privileged_origin`) e passa o par a `proxy.CheckPrivileged`. O módulo é o caminho do `go.mod` do plugin (com o sufixo `/vN`, se houver), não o do pacote `agent`
+  - **Por que inicializador de variável:** em `-buildmode=c-shared` a função `main` não roda; o registro precisa acontecer na inicialização do pacote, antes de o Envoy criar a config do filtro. Um inicializador de variável cumpre isso sem `func init()`, o que mantém a premissa "registro por função gerada, sem `init()`" do HLD do `n3x-sdk` (fecha a I-07 da FDD 16; I-03 aqui)
+  - **Sem panic na carga:** ID inválido, módulo vazio, plugin nulo, core ausente, `n3x.core` passado por `Plugin` ou ID repetido não derrubam o Envoy no `dlopen`; ficam em `Registration.Err()` e voltam no `Build` como `build_failed` (FDD 16) com as regras `registry_*` do contrato 3. Segunda chamada a `Register` marca o processo como inválido (`registry_twice`)
+  - **Só metade de proxy:** plugin só de controller não entra no registro do `.so`; continua na lista do manifesto (FDD 21). A metade só de fundo é exclusiva do core na v1 (FDD 09): um plugin de terceiro sem fase é recusado na subida (`privileged_capability`)
+  - **Símbolos exportados:** o código gerado e o `core/` não exportam símbolo. Os símbolos que o Envoy procura são os do ABI de dynamic modules, exportados pelo SDK Go do Envoy importado por `core/adapter/envoy140` (lista confirmada no spike da fase 0 e conferida pela FDD 23 contra o binário do Envoy do alvo)
+  - **Alvo:** `core/entry` importa `core/adapter/active`; o build usa `-tags` com `catalog.BuildTag()` (FDD 19, `n3x_envoy140`). Sem tag ou com duas, a compilação falha (FDD 16, contrato 2)
+  - **O que fica com o adaptador:** carga e versão do ABI, leitura da config do filtro, marcador de validação, processo único, `Start` e `Stop`, stats e fio (FDD 16). O que fica com `entry`: só compor e registrar
+  - **Composição de produção:** `Source` = leitor da FDD 22 sobre o próprio arquivo; `Containment` = `core/fault` (FDD 18); `Controller` = `core/grpcconn` (FDD 38); `Sidecar` = identidade da FDD 25, drenagem da FDD 29 e `ExitContext` das FDDs 29 e 38; `Privileged` = `proxy.CheckPrivileged` (FDD 09), nunca trocado em produção. Enquanto uma dessas FDDs não estiver implementada, `entry.Register` usa: fonte stub (`manifest_unavailable`), nenhuma contenção (o `Build` recusa com `containment_missing`), controller standalone e os padrões das partes da visão `Sidecar` (contrato 9). Um `.so` de produção só sobe depois da FDD 18 (hipótese H-07)
+  - **Estabilidade:** `Register`, `Core`, `Plugin` e `Registration` congelados na major do módulo `core/`; mudança só por adição (por exemplo, `RegisterWith(opções, ...)`); a imagem de build é 1:1 com a versão do `core/` (HLD do `n3x-builder`)
+
+**Exemplo de requisição** (`main.go` gerado para core, exemplo e rate limit; caminhos de módulo ilustrativos)
+```go
+// Code generated by n3x-plugin build. DO NOT EDIT.
+
+package main
+
+import (
+	"github.com/giustech/n3x-sidecar/core/entry"
+
+	giustech_ratelimit "github.com/giustech/n3x-plugin-ratelimit/agent"
+	n3x_core "github.com/giustech/n3x-plugin-core/agent"
+	n3x_example "github.com/giustech/n3x-example/agent"
+)
+
+var _ = entry.Register(
+	entry.Core("github.com/giustech/n3x-plugin-core", n3x_core.Plugin()),
+	entry.Plugin("giustech.ratelimit", "github.com/giustech/n3x-plugin-ratelimit", giustech_ratelimit.Plugin()),
+	entry.Plugin("n3x.example", "github.com/giustech/n3x-example", n3x_example.Plugin()),
+)
+
+func main() {}
+```
+
+**Exemplo de resposta** (compilação e logs da carga e da subida)
+```text
+$ go build -buildmode=c-shared -trimpath -ldflags=-buildid= -tags n3x_envoy140 -o libn3x.so .
+(ok)
+
+{"ts":"2026-10-20T14:00:00.950Z","level":"info","component":"core","msg":"adapter_loaded","target":"envoy-1.40","capabilities":"request_body,route_change","core_version":"1.0.0","go_version":"go1.26.0"}
+{"ts":"2026-10-20T14:00:01.150Z","level":"info","component":"core","service":"pedidos","msg":"privileged_granted","plugin_id":"n3x.core","instance":"core","module":"github.com/giustech/n3x-plugin-core","capabilities":"conn_interceptors,background_only,sidecar"}
+{"ts":"2026-10-20T14:00:01.190Z","level":"info","component":"core","service":"pedidos","msg":"chain_compiled","instances":3,"implicit":"n3x.core/core","groups":2,"layout":"traffic/20[rl-api] transform/50[add-header]","duration_ms":31}
+
+Registro com erro (entry.Plugin("n3x.core", ...) no lugar de entry.Core), na primeira criação da config do filtro:
+{"ts":"2026-10-20T14:00:01.020Z","level":"error","component":"core","msg":"filter_config_rejected","path":"registry[0].id","rule":"registry_core_id","detail":"n3x.core só entra por entry.Core; o main gerado está errado (FDD 21)"}
+
+Módulo do registro diferente do manifesto embutido (artefato adulterado ou erro do builder):
+{"ts":"2026-10-20T14:00:01.031Z","level":"error","component":"core","msg":"privileged_refused","plugin_id":"giustech.ratelimit","module":"github.com/acme/n3x-plugin-ratelimit","rule":"privileged_origin","path":"plugins[\"giustech.ratelimit\"].module","detail":"módulo do registro gerado diferente de plugins[].module do manifesto embutido"}
+```
+
+---
+
+**Contrato 2: registro e fábrica do executor (`chain.NewRegistry`, `chain.NewFactory`, `Options`)**
+- Tipo: sdk (API Go de `core/chain`, usada por `core/entry`, pelos testes e pelo harness de desenvolvimento)
+- Assinatura/Rota:
+  ```go
+  package chain // github.com/giustech/n3x-sidecar/core/chain
+
+  import sdkchain "github.com/giustech/n3x-sdk/chain"
+
+  type Registered struct {
+      ID     plugin.ID
+      Module string       // caminho do módulo gravado pelo builder (FDD 09)
+      Plugin proxy.Plugin
+      Core   bool         // verdadeiro só para o item de entry.Core
+  }
+
+  // Registry é o registro compilado no .so: imutável, em ordem de ID.
+  type Registry struct{ /* ... */ }
+
+  // NewRegistry confere as regras de geração (contrato 3, linhas 1 a 7) e ordena por ID.
+  func NewRegistry(items []Registered) (*Registry, error)
+  func (r *Registry) Len() int
+  func (r *Registry) At(i int) Registered
+  func (r *Registry) Lookup(id plugin.ID) (Registered, bool)
+  func (r *Registry) ConfigRegistered() []config.Registered // para config.VerifyRegistry (FDD 15)
+
+  // Source é o que a fonte do .so entrega (contrato 4).
+  type Source struct {
+      Schemas  config.SchemaSource  // manifestos e schemas de proxy (FDD 15)
+      Modules  map[plugin.ID]string // plugins[].module do manifesto embutido (FDDs 09 e 22)
+      Manifest []byte               // bytes da seção .n3x_manifest, para Sidecar().Manifest() (FDD 09)
+  }
+
+  type SourceFunc func(h adapter.Host, reg *Registry) (Source, error)
+
+  // PrivilegedFunc tem a assinatura de proxy.CheckPrivileged (FDD 09).
+  type PrivilegedFunc func(id plugin.ID, module string, m plugin.Manifest, inst proxy.Instance) error
+
+  type Options struct {
+      Source             SourceFunc         // obrigatório
+      Containment        Containment        // obrigatório em ModeServe (contrato 9, FDD 18)
+      Controller         ControllerProvider // nil = standalone (contrato 9, FDD 38)
+      Sidecar            SidecarParts       // partes da visão proxy.Sidecar das FDDs 25, 29 e 38 (contrato 9)
+      Privileged         PrivilegedFunc     // nil = proxy.CheckPrivileged; só chaintest e o harness trocam
+      InstantiateTimeout time.Duration      // 0 = DefaultInstantiateTimeout
+      MaxFreeStates      int                // 0 = DefaultMaxFreeStates
+  }
+
+  // NewFactory devolve a fábrica que o adaptador chama uma vez por processo (FDD 16, contrato 2).
+  func NewFactory(reg *Registry, opts Options) adapter.Factory
+
+  // FailingFactory devolve uma fábrica cujo Build sempre falha com err (registro inválido).
+  func FailingFactory(err error) adapter.Factory
+
+  const (
+      DefaultInstantiateTimeout = 5 * time.Second // hipótese
+      DefaultMaxFreeStates      = 1024            // hipótese
+      CoreConfig                = "{}"            // config da instância do core (FDD 09, contrato 4)
+  )
+  // Nome e ID do core vêm do SDK: plugin.CoreID(), plugin.CoreModule e proxy.CoreInstance (FDD 09).
+
+  var (
+      ErrRegistry           = errors.New("chain: registro do .so inválido")
+      ErrInstance           = errors.New("chain: instância não subiu")
+      ErrContainmentMissing = errors.New("chain: contenção de falhas ausente (FDD 18)")
+  )
+  ```
+- Método: n/a
+- Semântica:
+  - **Ordem:** `NewRegistry` ordena por ID; a ordem em que o `main` gerado escreve não muda nada em runtime (a FDD 21 escreve em ordem de ID só pela reprodutibilidade)
+  - **Fábrica pura:** `NewFactory` não faz I/O nem cria goroutine; todo o trabalho fica no `Build`. A mesma fábrica serve ao `.so`, aos testes (`chaintest`) e ao harness de desenvolvimento
+  - **Erros:** `Build` devolve um embrulho com `Unwrap() []error` que leva a sentinela da etapa (`ErrRegistry`, `config.ErrInvalidConfig`, `config.ErrSecret`, `config.ErrManifest`, `proxy.ErrPrivileged`, `ErrInstance`, `ErrContainmentMissing`) e `plugin.FieldErrors` com caminho e regra (mesmo padrão das FDDs 01, 02, 09 e 15). O adaptador loga `filter_config_rejected` com `build_failed` (FDD 16)
+  - **Portas:** `Containment`, `Controller` e `SidecarParts` são declaradas por `core/chain` e implementadas por `core/fault`, `core/grpcconn` e pelas FDDs 25 e 29 (inversão de dependência; a composição fica em `core/entry`)
+  - **`Privileged`:** em produção é sempre `proxy.CheckPrivileged`; a troca existe só para os testes e o harness de desenvolvimento usarem o core mínimo de `chaintest` antes de o plugin core existir (contrato 11, hipótese H-29)
+  - **Uso interno:** fora de `core/entry`, a API de `core/chain` só é usada dentro do módulo `core/` e pelos testes; ela pode mudar por minor (hipótese H-25), enquanto `core/entry` é congelada na major
+
+**Exemplo de requisição**
+```go
+reg, err := chain.NewRegistry([]chain.Registered{
+    {ID: plugin.MustParseID("n3x.example"), Module: "github.com/giustech/n3x-example", Plugin: example.Plugin()},
+    {ID: plugin.CoreID(), Module: plugin.CoreModule, Plugin: core.Plugin(), Core: true},
+    {ID: plugin.MustParseID("n3x.example"), Module: "github.com/giustech/n3x-example", Plugin: example.Plugin()},
+})
+fmt.Println(err)
+```
+
+**Exemplo de resposta**
+```text
+registry["n3x.example"]: ID registrado mais de uma vez no .so [duplicate]
+errors.Is(err, chain.ErrRegistry) == true
+```
+
+---
+
+**Contrato 3: subida (`Build`): ordem, cadeia inerte e problemas**
+- Tipo: method (implementação de `adapter.Factory.Build` e de `adapter.Chain`)
+- Assinatura/Rota: `Build(h adapter.Host) (adapter.Chain, error)`, chamada pelo adaptador na primeira criação da config do filtro (FDD 16, contrato 1)
+- Método: n/a
+- Semântica de status/headers:
+  - **Ordem em `ModeServe`:** os 14 passos do fluxo de subida (seção 4). Configs de plugin são abertas por `Instantiate` com `cfg.Opener()` (FDDs 05 e 15); `controller.secret` é aberto por `config.Load` e chega ao core por `Sidecar().ControllerSettings()` (FDD 09) e à conexão pela FDD 38
+  - **Ordem em `ModeValidate`:** registro, fonte, `VerifyRegistry`, conferência de origem pelo manifesto, `config.Load` com `SecretsVerify` e `Configure`; devolve a cadeia inerte. A cadeia inerte tem `RequestBodyLimit()` do arquivo; `Start`, `Stop` e os hooks nunca são chamados pelo adaptador (FDD 16); se forem, devolvem `Continue` sem efeito
+  - **Instância do core:** criada antes de `cfg.Instances`; problemas dela usam o caminho `plugins["n3x.core"]`, o mesmo das recusas da FDD 09 (`plugin.PrefixErrors` com `PathKey("plugins", id)`) (hipótese H-20)
+  - **Origem (FDD 09):** a conferência por manifesto (passo 4) acumula todos os problemas antes do `config.Load`; a conferência por instância (depois do `New` e do selo) para a subida no primeiro plugin recusado, como o `New` (H-14)
+  - **Prazo do `Instantiate`:** cada chamada roda numa goroutine com `recover` e espera no máximo `InstantiateTimeout` (5 s). Estourado, a subida falha com `new_timeout`, o selo acontece mesmo assim e a goroutine fica abandonada (o Envoy não sobe e o processo termina). Motivo: nenhuma operação sem prazo (ADR-006); o `New` não faz I/O de rede (FDD 06), então 5 s é folga larga
+  - **Parada no primeiro `New` com falha** (hipótese H-14): config já foi validada por `config.Load`; falha no `New` é rara e as seguintes podem depender do estado da primeira. Os problemas de config continuam todos numa passada (FDD 15)
+  - **Nenhuma tarefa roda numa subida que falhou:** as tarefas só começam no `Start`, que o adaptador só chama depois de um `Build` com sucesso (FDD 06)
+  - **Regras próprias** (códigos estáveis na major do `core/`, caminho pela convenção L-34):
+
+| # | Caminho | Regra | Condição | Sentinela |
+| --- | --- | --- | --- | --- |
+| 1 | `registry` | `registry_core_missing` | Nenhum `entry.Core` válido | `ErrRegistry` |
+| 2 | `registry[i]` | `registry_nil` | Plugin nulo | `ErrRegistry` |
+| 3 | `registry[i].id` | `id_format`, `id_part_length`, `id_part_start` | ID que `plugin.ParseID` recusa (FDD 01) | `ErrRegistry` |
+| 4 | `registry[i].id` | `registry_core_id` | `n3x.core` passado por `entry.Plugin` | `ErrRegistry` |
+| 5 | `registry["<id>"]` | `duplicate` | ID repetido | `ErrRegistry` |
+| 6 | `registry` | `registry_twice` | `entry.Register` chamado mais de uma vez | `ErrRegistry` |
+| 7 | `registry[i].module` | `registry_module` | Módulo vazio ou que não é caminho de módulo Go válido | `ErrRegistry` |
+| 8 | (manifesto) | `manifest_unavailable`, `manifest_read` e regras das linhas 35 a 38 da FDD 15 | Fonte indisponível ou manifesto inválido | `config.ErrManifest` |
+| 9 | `plugins["<id>"]` | `registry_missing`, `registry_unexpected`, `schema_mismatch` | `config.VerifyRegistry` (FDD 15) | `config.ErrManifest` |
+| 10 | `plugins["<id>"].module` | `privileged_origin` | Módulo do registro diferente de `plugins[].module` do manifesto embutido (FDD 09) | `proxy.ErrPrivileged` |
+| 11 | `plugins["<id>"]...` | `privileged_origin`, `privileged_capability` | `proxy.CheckPrivileged(id, módulo, manifesto, nil)`: `n3x.core` de outro módulo; metade só de fundo fora do core (`privileged.background_only`) (FDD 09, contrato 2) | `proxy.ErrPrivileged` |
+| 12 | caminhos do `n3x.yaml` | regras do contrato 2 da FDD 15 | `config.Load` | `config.ErrInvalidConfig`, `config.ErrSecret` |
+| 13 | (fábrica) | `containment_missing` | `Options.Containment` nulo em `ModeServe` | `ErrContainmentMissing` |
+| 14 | `plugins[i]` ou `plugins["n3x.core"]` | `metric_reserved`, `duplicate` | `InstanceTelemetry` recusou (namespace reservado, instância repetida, FDDs 06 e 16) | `ErrInstance` |
+| 15 | `plugins[i].config.<campo>` | regras da FDD 02, inclusive `secret_open` | `Instantiate` recusou a config | `ErrInstance` e `plugin.ErrInvalidConfig` |
+| 16 | `plugins[i]` ou `plugins["n3x.core"]` | `new_failed` | `New` devolveu erro | `ErrInstance` e o erro do plugin |
+| 17 | idem | `new_nil` | `proxy.ErrNilInstance` | `ErrInstance` |
+| 18 | idem | `new_panic` | Panic no `New`, inclusive `ErrTooManyTasks`, `ErrSealed`, `ErrMetricConflict` e os panics de `memory.NewMap` | `ErrInstance` e a sentinela recuperada, se for `error` |
+| 19 | idem | `new_timeout` | `Instantiate` não voltou em 5 s | `ErrInstance` |
+| 20 | `plugins["<id>"].instance`, `.privileged.<privilégio>`, `.hooks` | `privileged_origin`, `privileged_capability`, `core_capability_missing`, `background_only_hooks` | `proxy.CheckPrivileged(id, módulo, manifesto, inst)` depois do `New` e do selo: tipo do core fora do módulo; `ConnInterceptorProvider` fora do core; core sem ele; core com hook (FDD 09, contrato 2) | `proxy.ErrPrivileged` |
+| 21 | `plugins["n3x.core"].privileged.conn_interceptors` | `core_capability_missing` | Com a seção `controller`, `ConnInterceptors()` devolveu valor nulo ou deu panic (FDD 09, contrato 3) | `proxy.ErrPrivileged` |
+| 22 | `chain` | `compile` e os códigos da FDD 15 | `sdkchain.Compile` recusou (defensivo: não acontece com config validada) | `ErrInstance` e `sdkchain.ErrInvalidSpec` |
+
+  - **Detalhe do erro do plugin:** `detail` traz o texto do erro do `New` cortado em 1 KiB sem quebrar UTF-8; panic traz o valor cortado e `stack` cortado em 16 KiB, uma vez (a subida falha) (hipótese H-23). `plugin.Secret` sai como `***` (FDD 03); `.Reveal()` dentro de erro é tratado pela análise estática (FDD 24, regra `reveal_in_log`)
+  - **Recusas da FDD 09:** um log `privileged_refused` por problema, com `plugin_id`, `module`, `capability`, `rule`, `path` e `detail` (mensagem da FDD 09, sem valor de config)
+
+**Exemplo de requisição** (`n3x.yaml` válido; o `New` do `giustech.waf`, segundo item, dá panic)
+```yaml
+version: 1
+service: pedidos
+plugins:
+  - { id: n3x.example, instance: add-header, config: { header: X-N3X, deny_path: /admin/ } }
+  - { id: giustech.waf, instance: waf, phase: authz, order: 10, config: { rules: [] } }
+```
+
+**Exemplo de resposta** (logs JSON da subida, `component=core`)
+```text
+{"ts":"2026-10-20T14:00:01.101Z","level":"info","component":"core","service":"pedidos","msg":"config_loaded","config_file":"/etc/n3x/n3x.yaml","instances":2,"plugins":"giustech.waf,n3x.example","secrets_sealed":0,"secrets_in_clear":0,"duration_ms":3}
+{"ts":"2026-10-20T14:00:01.102Z","level":"info","component":"core","service":"pedidos","msg":"memory_quota","plugin_id":"n3x.core","max_bytes":16777216,"source":"default"}
+{"ts":"2026-10-20T14:00:01.110Z","level":"info","component":"core","service":"pedidos","msg":"plugin_hooks","plugin_id":"n3x.example","instance":"add-header","phase":"transform","order":50,"failure":"open","hooks":"request_headers","matched":false,"target":"envoy-1.40"}
+{"ts":"2026-10-20T14:00:01.113Z","level":"error","component":"core","service":"pedidos","msg":"instance_failed","plugin_id":"giustech.waf","instance":"waf","path":"plugins[1]","rule":"new_panic","detail":"panic: runtime error: index out of range [0] with length 0","stack":"goroutine 12 [running]:\n..."}
+{"ts":"2026-10-20T14:00:01.114Z","level":"error","component":"core","service":"pedidos","msg":"filter_config_rejected","path":"plugins[1]","rule":"build_failed","detail":"instância não subiu: new_panic"}
+```
+
+---
+
+**Contrato 4: fonte dos manifestos e schemas, e harness de desenvolvimento (`SourceFunc`, `RegisterDev`, L-35)**
+- Tipo: sdk (API Go de `core/entry`, com a tag `n3x_dev` para o harness)
+- Assinatura/Rota:
+  ```go
+  package entry
+
+  // Produção (FDD 22): lê a seção .n3x_manifest do próprio arquivo do .so e devolve
+  // schemas, módulos (plugins[].module) e os bytes do manifesto.
+  // Até a FDD 22, devolve um problema manifest_unavailable (FDD 15, linha 35).
+  func SelfSource(h adapter.Host, reg *chain.Registry) (chain.Source, error)
+  ```
+  ```go
+  //go:build n3x_dev
+
+  package entry
+
+  // RegisterDev é o Register do harness de desenvolvimento: sem ELF, sem builder.
+  // manifests tem um <id>.yaml por plugin registrado (cópia do n3x-plugin.yaml).
+  func RegisterDev(manifests fs.FS, core Item, plugins ...Item) Registration
+  ```
+- Método: n/a
+- Semântica:
+  - **Produção (H-04 da FDD 15):** a fonte é a seção `.n3x_manifest` do próprio arquivo carregado, pelo leitor da FDD 22, para o `.so` usar os mesmos bytes que o entrypoint usou; o registro compilado não é fonte, só é conferido por `VerifyRegistry`. O `.so` descobre o próprio caminho em `/proc/self/maps`, pelo mapeamento que contém o endereço de uma função de `core/entry`, sem cgo; sem achar, usa `config.DefaultSO` (`/usr/lib/n3x/libn3x.so`) (hipótese H-04; a FDD 22 confirma)
+  - **Harness de desenvolvimento (L-35):** existe para testar o executor e o adaptador num Envoy real antes do builder (FDD 21) e sem o manifesto embutido (FDD 22). `RegisterDev`:
+    - lê `<id>.yaml` de `manifests` para cada item do registro (`yamlconv.ToJSON` e `plugin.DecodeManifest`, FDD 01); arquivo ausente vira `dev_manifest_missing`
+    - usa como schema os bytes de `p.ConfigSchema().MarshalJSON()` do próprio registro, então `VerifyRegistry` passa por construção: o harness não confere schema contra manifesto, e diz isso no log
+    - monta `config.NewPluginInfo` e `config.NewStaticSource` (decisão pedida pela FDD 15, contrato 4); `Modules` vem do próprio registro (a conferência de módulo passa por construção) e `Manifest` é vazio (`Sidecar().Manifest()` devolve `[]byte{}`)
+    - registra a fábrica com a mesma composição do `Register`, salvo a fonte e, antes de existir o plugin core, a conferência de origem `chaintest.PrivilegedCheck()` (contrato 11)
+    - a cada `Build`, loga `dev_registry` em `warn`
+  - **Separação de produção:** `RegisterDev` só existe com a tag `n3x_dev`, que o builder nunca passa (pedido à FDD 21); o `.so` de desenvolvimento não tem `.n3x_manifest`, então o `n3x run` o recusa no pré-voo (FDD 25). O harness roda o Envoy direto, com bootstrap próprio de `dev/`
+  - **Onde fica:** `n3x-sidecar/cmd/libn3x-dev/main.go` (registro com o plugin core, o `n3x.example` da FDD 13 e o `conformance.ScriptPlugin()` da FDD 07) e `cmd/libn3x-dev/manifests/*.yaml`; `n3x-sidecar/dev/` com `Dockerfile.dev` (estágio com a imagem do Envoy do alvo, Go 1.26 e gcc, como o `.so` de conformidade da FDD 16), `compose.yaml` (Envoy 1.40, aplicação de eco HTTP e gRPC), `bootstrap.yaml` e `n3x.yaml`
+  - **Plugin core antes da FDD 36:** o harness usa `chaintest.CorePlugin()` (metade só de fundo com ID `n3x.core`, sem hooks, sem tarefas e com `ConnInterceptors` que só repassam a chamada), registrado com o módulo `chaintest.CoreModule`. Como o tipo dele não mora em `github.com/giustech/n3x-plugin-core`, a regra do tipo dinâmico da FDD 09 o recusaria; por isso o harness troca `Privileged` por `chaintest.PrivilegedCheck()`, que aceita só essa origem de teste e aplica todas as outras regras (H-29). Com o plugin core real (FDD 36), o harness passa a usá-lo com `proxy.CheckPrivileged` sem troca
+  - **Deriva das cópias:** um teste da CI do `n3x-sidecar` compara cada `manifests/<id>.yaml` com o `n3x-plugin.yaml` do módulo resolvido no `go.mod` (`go list -m -f {{.Dir}}`) e reprova se divergirem (hipótese)
+
+**Exemplo de requisição** (`cmd/libn3x-dev/main.go`)
+```go
+//go:build n3x_dev
+
+package main
+
+import (
+	"embed"
+	"io/fs"
+
+	"github.com/giustech/n3x-sdk/sdktest/conformance"
+	"github.com/giustech/n3x-sidecar/core/chain/chaintest"
+	"github.com/giustech/n3x-sidecar/core/entry"
+
+	n3x_example "github.com/giustech/n3x-example/agent"
+)
+
+//go:embed manifests/*.yaml
+var files embed.FS
+
+var manifests, _ = fs.Sub(files, "manifests")
+
+var _ = entry.RegisterDev(manifests,
+	entry.Core(chaintest.CoreModule, chaintest.CorePlugin()),
+	entry.Plugin("n3x.example", "github.com/giustech/n3x-example", n3x_example.Plugin()),
+	entry.Plugin("sdktest.script", "github.com/giustech/n3x-sdk", conformance.ScriptPlugin()),
+)
+
+func main() {}
+```
+
+**Exemplo de resposta**
+```text
+$ docker compose -f dev/compose.yaml up --build
+envoy-1  | {"ts":"2026-10-20T14:10:00.201Z","level":"warn","component":"core","service":"dev","msg":"dev_registry","plugins":"n3x.core,n3x.example,sdktest.script","detail":"harness de desenvolvimento: manifestos de cópia, schema do próprio registro, sem integridade; nunca use em produção"}
+envoy-1  | {"ts":"2026-10-20T14:10:00.233Z","level":"info","component":"core","service":"dev","msg":"chain_compiled","instances":3,"implicit":"n3x.core/core","groups":2,"layout":"authz/10[script-a,script-b] transform/50[add-header]","duration_ms":18}
+
+$ n3x run --config dev/n3x.yaml --so dev/out/libn3x.so
+erro N3X-S004: libn3x.so sem a seção .n3x_manifest (gerado fora do n3x-plugin build)
+```
+
+---
+
+**Contrato 5: montagem do `proxy.Env`, do `proxy.CoreEnv` e ciclo de vida dos recursos da instância (D-09, FDDs 04, 06 e 09)**
+- Tipo: method (o executor implementa `proxy.Env` e, só para o core, `proxy.CoreEnv` e `proxy.Sidecar` por composição)
+- Assinatura/Rota: tipos não exportados `env`, `coreEnv` e `sidecarView` em `core/chain`, que implementam `proxy.Env` (FDD 06, contrato 1), `proxy.CoreEnv` e `proxy.Sidecar` (FDD 09, contratos 4 a 9); para testes, `chain.SidecarView(c adapter.Chain) (proxy.Sidecar, bool)` devolve a visão entregue ao core
+- Método: n/a
+- Semântica:
+
+| Método do `Env` | Origem | FDD dona |
+| --- | --- | --- |
+| `Target()` | `Host.Target()` | 16 |
+| `Instance()` | `plugins[i].instance`; no core, `proxy.CoreInstance` (`core`) | 17 (FDD 09 para o nome do core) |
+| `Memory()` | `scope.Handle()` do escopo da instância na conta do plugin | 17 (contrato da FDD 04) |
+| `Metrics()`, `Log()` | `InstanceTelemetry` da telemetria do `.so` | 16 |
+| `Background`, `Dial`, `HTTPClient` | `InstanceContainment` (contrato 9) | 18 |
+| `Controller()` | `ControllerProvider.ForPlugin(id)`; sem provedor, `(nil, proxy.ErrStandalone)` | 38 |
+| `Sidecar()` (só no `CoreEnv` do core) | `sidecarView` (tabela abaixo) | 17, com as partes das FDDs 16, 25, 29 e 38 |
+
+  - **`proxy.CoreEnv` só para o core** (FDD 09, contrato 4): o executor monta o `coreEnv` (o `env` comum mais `Sidecar()`) só para a instância do `n3x.core` cuja origem passou na conferência por manifesto (passo 4); para as demais, o tipo concreto não implementa `Sidecar()` e `env.(proxy.CoreEnv)` é falso, sem log
+  - **Visão `proxy.Sidecar` do core** (dados calculados uma vez na subida; cópia nova a cada chamada que devolve bytes ou fatias):
+
+| Método | Origem no executor | Padrão sem a FDD dona |
+| --- | --- | --- |
+| `Identity()` | `Options.Sidecar.Identity` (FDD 25) | `SidecarIdentity{Service: <service>}` |
+| `ControllerSettings()` | `config.Config`: `controller.address`, `ControllerSecret()` (já aberto, FDD 15), `heartbeat_interval`, `timeouts.call` e `timeouts.login`; `false` no standalone | o próprio executor (sem porta) |
+| `Manifest()` | `Source.Manifest` (FDD 22) | `[]byte{}` no harness |
+| `ConfigInput()` | calculado pelo executor (abaixo) | o próprio executor |
+| `NextEvent(ctx)` | `EventQueue.Next(ctx)`; standalone: `proxy.ErrStandalone` na hora | o próprio executor |
+| `Draining()` | canal devolvido por `Options.Sidecar.Drain(fila)` (FDD 29) | canal que nunca fecha |
+| `ExitContext()` | `Options.Sidecar.ExitContext` (FDDs 29 e 38) | `ctx` com marca de segundo plano e prazo de `proxy.ExitTimeout` (1,5 s) |
+| `Session()` | `SessionReporter` sobre `Platform().Controller()` da telemetria (FDD 16, L-12) | o próprio executor |
+
+  - **`ConfigInput` (FDD 09, contrato 6; L-07):** `Sidecar` = topo efetivo do `n3x.yaml` (com padrões) em JSON normalizado, sem `plugins` e sem `controller.secret`; `Plugins` = um `PluginConfig` por item de `cfg.Instances`, na ordem do arquivo, sem o core: `ID`, `Instance`, `Phase`, `Order`, `Failure`, `Settings` (`async` e `match` com padrões), `Schema` (o do manifesto) e, pela função pura `proxy.NewPluginConfig` pedida ao SDK (contrato 10), `Config` (`Schema.Normalize` sem opener, `ENC[...]` intacto, texto de segredo em claro trocado por `""`) e `Secrets` (`SecretMark` por campo segredo, `sealed`, `in_clear` ou `empty`, impressão digital de `plugin.SecretFingerprint`). Calculado uma vez no `Build`
+  - **Eventos da subida (FDD 09, contrato 7):** com a seção `controller`, o executor cria a `proxy.EventQueue` com `proxy.MaxPendingEvents` e empurra, antes de qualquer `New`, um `config_error` por aviso não fatal do `Report` (menos `secret_in_clear`; `Detail` = `<caminho> [<código>]`) e um `secret_in_clear` por segredo em claro (caminho absoluto, `plugins[1].config.tokens[0]` ou `controller.secret`), com `Plugin` e `Instance` quando o caminho está em `plugins[i]`. A mesma fila vai para a contenção (`panic`, `breaker_open`, `plugin_disabled`, FDD 18) e para a drenagem (`drain_start`, FDD 29). Um coletor da telemetria lê `EventQueueStats` para as métricas `n3x_sidecar_events_*` (FDDs 09 e 16). No `Stop`, eventos não lidos são perdidos e o executor loga `core_events_lost` com a contagem por tipo
+  - **Interceptors do core:** com a seção `controller`, depois do `New`, do selo e do `CheckPrivileged` do core, o executor chama `ConnInterceptors()` uma vez sob `recover`, confere os dois valores não nulos e entrega a `ControllerProvider.Install` (FDD 38), que os põe como os mais internos da conexão. Sem provedor (antes da FDD 38), confere e descarta
+  - **Standalone** (FDD 09): a instância do core é criada mesmo assim e fica inativa: `ControllerSettings()` devolve `false`, `NextEvent` devolve `ErrStandalone`, não há fila nem `ConnInterceptors()`
+
+  - **Contas por plugin** (FDDs 04 e 06): para cada plugin com pelo menos uma instância, e sempre para o `n3x.core`: `memRt.NewAccount(id.String(), limites.MemoryMaxBytes)` (0 vale o padrão de 16 MiB), conta de métricas (criada pela FDD 16 na primeira `InstanceTelemetry`) e `PluginContainment` com `background.max_tasks` e `dial.max_conns` (FDD 18). Logs `memory_quota` (FDD 04) e `plugin_limits` (FDD 06), um por plugin, com `source` igual a `default` ou `n3x.yaml`
+  - **Coletor de memória** (pedido da FDD 16): `rt.AddCollector("memory/<id>", fn)`, em que `fn` lê `acc.Stats()`, chama `Platform().Plugin(id).SetMemory(s)` e, se `Oversize` subiu desde a última leitura, loga `memory_oversize` no máximo uma vez por minuto por plugin (FDD 04)
+  - **Ciclo de vida de uma instância:** escopos criados; `Env` montado; `Instantiate` sob `recover` com prazo; `defer` que sela, nesta ordem, `it.Metrics.Seal()`, `scope.Seal()` e as tarefas (`ic.Seal`); `HooksOf`; `Platform().Instance(...)` com o `HookSet`. Depois do selo, `NewMap`, criação de métrica e `Background` dão panic (FDDs 04 e 06)
+  - **Início:** `Chain.Start()` roda `memRt.Run(ctx)` numa goroutine com `recover` e rótulo de pprof `component=memory` (fora do limite de tarefas, FDD 04), `Containment.Start()` (tarefas de fundo, uma vez, na ordem de registro, com as do core primeiro porque o core é instanciado primeiro) e `ControllerProvider.Start()`. Volta em até 10 ms (`adapter.StartBudget`)
+  - **Parada:** `Chain.Stop(ctx)` chama `Containment.Stop(ctx)` (até `ShutdownGrace`, 2 s), `ControllerProvider.Stop(ctx)` e cancela o `ctx` do `memRt.Run`; volta até o prazo do `ctx`
+  - **Instância do core (L-10, FDD 09, contrato 4):** uma por processo, criada antes das demais, também no standalone, com nome `proxy.CoreInstance`, config `{}` (`CoreConfig`), `CoreEnv` e os limites de `runtime.plugin_limits["n3x.core"]`. Ela não entra em `sdkchain.Compile` e nunca recebe hook de requisição; hook implementado por ela recusa a subida (`background_only_hooks`). A metade só de fundo é exclusiva do core: outro plugin sem fase é recusado na conferência por manifesto (`privileged.background_only`)
+  - **Concorrência:** um `Env` por instância, seguro entre goroutines (FDD 06); a instância é compartilhada por todos os workers
+
+**Exemplo de requisição**
+```go
+// Dentro do Build, para a instância rl-api (plugins[1]) do giustech.ratelimit
+it, _ := h.Telemetry().InstanceTelemetry(id, "rl-api")
+sc, _ := acc.NewScope("rl-api")
+ic, _ := pc.Instance(chain.InstanceRef{ID: id, Instance: "rl-api", Phase: plugin.PhaseTraffic, Failure: plugin.FailClosed, Async: inst.Async})
+e := &env{target: h.Target(), name: "rl-api", mem: sc.Handle(), tel: it, ic: ic, ctl: ctl.ForPlugin(id)}
+val, err := instantiate(ctx5s, p, inst.Config, e, plugin.WithSecretOpener(cfg.Opener()))
+```
+
+**Exemplo de resposta**
+```json
+{
+  "env.Target().Name()": "envoy-1.40",
+  "env.Instance()": "rl-api",
+  "env.Memory()": "handle do escopo rl-api na conta giustech.ratelimit (32 MiB, de runtime.plugin_limits)",
+  "env.Controller() sem a FDD 38": { "conn": null, "err": "proxy: modo standalone" },
+  "env.(proxy.CoreEnv) em rl-api": false,
+  "depois do New": { "env.Metrics().Counter(\"x\", \"...\")": "panic telemetry.ErrSealed", "env.Background(\"t\", fn)": "panic proxy.ErrSealed" },
+  "core: env.Instance()": "core",
+  "core: Sidecar().ConfigInput().Plugins[1].Secrets": [{ "Path": "redis.password", "State": "sealed", "Fingerprint": "51e0c3aa9b12" }],
+  "core: Sidecar().NextEvent primeiro evento": { "Seq": 1, "Kind": "secret_in_clear", "Plugin": "n3x.example", "Instance": "add-header", "Detail": "plugins[0].config.token" },
+  "logs": ["memory_quota", "plugin_limits", "privileged_granted", "plugin_hooks"]
+}
+```
+
+---
+
+**Contrato 6: execução por requisição, vereditos e `Stream` do sidecar**
+- Tipo: method (implementação de `adapter.RequestHooks`, FDD 16, contrato 3)
+- Assinatura/Rota:
+  ```go
+  // Implementados pela Chain devolvida por Build (tipo não exportado).
+  OnRequestHeaders(r adapter.Request, endOfStream bool) adapter.Verdict
+  OnRequestBody(r adapter.Request, b adapter.Body) adapter.Verdict
+  OnResume(r adapter.Request, t adapter.Token) adapter.Verdict
+  OnResponseHeaders(r adapter.Request, endOfStream bool) adapter.Verdict
+  OnComplete(r adapter.Request)
+  ```
+- Método: n/a (chamadas no worker do Envoy, em série dentro de uma requisição)
+- Semântica de status/headers:
+  - **Estado por requisição** (`reqState`, tipo não exportado): `sdkchain.Exchange` reaproveitável, trava, geração (`uint64`), token do adaptador, número de funções pendentes, tabela de funções do grupo (`[]slot`, tamanho igual ao maior grupo da cadeia compilada, alocada uma vez por estado), marca de encerrada, instante do início do hook e amostragem dos logs. O próprio `reqState` implementa `sdkchain.Guard` (ponteiro em interface, sem alocar)
+  - **Lista livre própria** (hipótese H-12): pilha com trava, até `MaxFreeStates` (1.024) estados; acima disso o estado é descartado ao GC. Não usa `sync.Pool`, que esvazia a cada ciclo do GC e alocaria no caminho quente. `n3x_sidecar_chain_inflight` mostra os estados em uso
+  - **Cruzamento 1:** pega o estado, `r.SetValue(st)`, `x.Reset(st, r.Headers(), !endOfStream, r.IsGRPC())` (refino do contrato 10: a regra de gRPC fica só no adaptador, pedido da FDD 16) e laço de condução
+  - **Laço de condução:** tabela da seção 4. Vereditos sempre dentro da tabela de vereditos aceitos da FDD 16 (`NeedBody` só na direção de request e só com body)
+  - **Cruzamento 2:** `OnRequestBody` chama `x.SetBody(b.Data)` ou `x.SetBodyOverLimit(b.Size)` e volta ao laço; o `chain` decide `body_limit` pela política (FDD 05)
+  - **Cruzamento 3:** `OnResume` toma a trava, confere o token guardado, solta e volta ao laço (os resultados já estão no `Exchange`, contrato 7)
+  - **Cruzamento 4:** `x.Response(r.Status(), r.ResponseHeaders())` e laço; só acontece se a requisição foi encaminhada (negação do N3X não passa por aqui, FDD 16)
+  - **Cruzamento 5:** contrato 7 (desconexão) ou, sem pendência, `x.Complete()`; depois, geração + 1, `r.SetValue(nil)` e o estado volta à lista livre
+  - **`Stream` e `RouteStream` do sidecar:** são as duas visões concretas do `sdkchain.Exchange` (FDD 07, L-50) sobre o `*adapter.HeaderMap` (FDD 16), que já satisfaz `sdkchain.HeaderMap`. Os acessores (`Path`, `Get`, `At`, `RequestID`, `Method`, `Authority`, `GRPCMethod`, `GRPCService`) devolvem strings da arena da requisição, sem cópia e sem alocação; fisicamente valem até o `filter_destroy`, mas o contrato continua "até o hook retornar" (FDD 05). `RequestID()` é o `x-request-id` gerado pelo Envoy. `ErrStreamClosed` vem do contador de geração do `chain`. `RouteStream` só em hooks de request de `access`, `authn` e `route` (tipo concreto diferente, FDD 05)
+  - **Semântica das ações** (regras do `chain`, aplicadas igual no kit):
+
+| Ação | Hook de request (headers ou body) | Hook de response | Dentro de um grupo |
+| --- | --- | --- | --- |
+| `Continue` | Mudanças pendentes até o fim do grupo; segue | Igual | Aplicadas no fim, em ordem alfabética de `instance` (vale a última) |
+| `s.Deny(resp)` | Cadeia para; `StepRespond`; nenhuma fase seguinte e nenhum hook de response | Troca a resposta da aplicação; as fases de response seguintes não rodam | Vence a da primeira instância em ordem alfabética; posteriores a uma negação síncrona não são chamadas; posteriores com `Go()` são canceladas |
+| `s.Go(fn)` | `Pause`; retoma em `OnResume` | Igual | O grupo espera todas as funções |
+| `proxy.Fail(err)` | `closed`: efeito do `sdkchain.Effect` (503, 504 ou 413); `open`: segue sem as mudanças da instância | Igual | `closed` concorre como negação; `open` só descarta as mudanças dela |
+| `rs.SetRoute(r)` | Só `access`, `authn` e `route`, com `route_change`; `r.RouteChanged()` antes de liberar | Não existe | Dois `SetRoute` no mesmo grupo de `access` ou `authn`: vale o último em ordem alfabética e o log `route_conflict` |
+
+  - **`OnComplete`:** para toda instância do recorte que implementa o hook, avaliado no path final, inclusive fases não alcançadas, depois de negação, falha ou desconexão (FDD 05, não "só as que rodaram", I-01). Ordem: a da cadeia compilada (fase, `order`, `instance`), determinística, mas o contrato não garante ordem ao plugin (FDD 05) (hipótese H-09). Sem prazo próprio: hook síncrono não pode ser interrompido; a duração aparece em `n3x_plugin_duration_seconds{hook="complete"}` e o alerta de p99 da FDD 05 vale. Instância com disjuntor aberto não recebe (H-11)
+  - **`Status()` no `OnComplete`:** status da resposta que passou pelos hooks de response; depois de negação do N3X, o status HTTP nominal da negação (403 também em gRPC), coerente com o rótulo `code` de `n3x_plugin_denies_total`; 0 se o cliente saiu antes da resposta (H-10)
+  - **Negação:** `r.Reply(x.Deny())`; o adaptador aplica `Effective()` de novo e escreve HTTP ou gRPC trailers-only (FDD 16, contrato 5). O executor conta `Deny(status)` na instância vencedora quando a causa é negação do plugin (`x.Denier()`, contrato 10); negação causada por falha `closed` conta como falha na FDD 18 (H-19)
+  - **Custo:** 0 alocações em todo o caminho síncrono; duas leituras do relógio monotônico por hook, reaproveitando o fim de um como início do próximo (FDD 16)
+
+**Exemplo de requisição** (duas instâncias do exemplo na fase `transform`: `add-header` com `header: X-N3X` e `deny_path: /admin/`; `deny-grpc` com `header: X-N3X` e `deny_path: /pedidos.v1.Pedidos/Excluir`; a semântica do `deny_path` é da FDD 13)
+```text
+GET /pedidos/7 HTTP/1.1                          (HTTP/1.1)
+POST /pedidos.v1.Pedidos/Obter HTTP/2            (gRPC, content-type: application/grpc)
+GET /admin/usuarios HTTP/2                       (HTTP/2)
+POST /pedidos.v1.Pedidos/Excluir HTTP/2          (gRPC)
+```
+
+**Exemplo de resposta** (cruzamentos, vereditos e o que a aplicação e o cliente recebem)
+```json
+[
+  { "req": "GET /pedidos/7", "cruzamentos": ["OnRequestHeaders: StepForward, Continue", "OnResponseHeaders: StepResponseDone, Continue", "OnComplete"], "aplicação recebe x-n3x": "1", "alocações": 0 },
+  { "req": "gRPC Obter", "cruzamentos": ["OnRequestHeaders: Continue", "OnResponseHeaders: Continue", "OnComplete"], "aplicação recebe x-n3x": "1" },
+  { "req": "GET /admin/usuarios", "cruzamentos": ["OnRequestHeaders: StepRespond, Reply(Forbidden), Replied", "OnComplete com Status 403"], "cliente": { ":status": 403, "content-type": "text/plain; charset=utf-8" }, "n3x_plugin_denies_total{plugin=\"n3x.example\",instance=\"add-header\",code=\"403\"}": "+1" },
+  { "req": "gRPC Excluir", "cruzamentos": ["OnRequestHeaders: StepRespond, Reply(Forbidden), Replied", "OnComplete com Status 403"], "cliente": { ":status": 200, "content-type": "application/grpc", "grpc-status": "7", "trailers-only": true }, "n3x_plugin_denies_total{instance=\"deny-grpc\",code=\"403\"}": "+1" }
+]
+```
+
+---
+
+**Contrato 7: grupo paralelo e `Go()`: entrega dos resultados, cancelamento e retomada**
+- Tipo: method (protocolo entre o executor, o `Exchange` e a porta `Launch` da FDD 18)
+- Assinatura/Rota:
+  ```go
+  package chain
+
+  // Async descreve uma função do Go() entregue à porta Launch (contrato 9).
+  type Async struct {
+      Ctx  context.Context                    // cancelável pelo executor (grupo e desconexão); com request_id (FDD 06)
+      Fn   func(context.Context) proxy.Result // devolvida por Exchange.Async(i)
+      Done Completion                         // chamada exatamente uma vez, de qualquer goroutine
+  }
+  // O prazo é o plugins[].async.timeout da instância, conhecido pela porta (InstanceRef.Async, contrato 9).
+
+  // Completion recebe o fim de uma função: resultado do plugin (c == 0) ou causa
+  // (CausePanic, CauseDeadline; CauseCanceled é ignorada pelo executor).
+  type Completion interface {
+      Complete(r proxy.Result, c sdkchain.Cause, err error)
+  }
+  ```
+- Método: n/a
+- Semântica:
+  - **Início (worker):** com `StepAsync{Start}`, o executor toma a trava do estado, guarda `token := r.NewToken()`, e para cada índice `i` de `Start`, em ordem crescente: cria o `ctx` do slot (cancelável, com `request_id` copiado, porque a arena some no fim da requisição), pega `in, fn := x.Async(i)` e chama `ic.Launch(&Async{...})`. Se `Launch` devolve falso (`max_inflight`, FDD 18), chama `x.Abort(i, CauseOverflow, nil)` na hora e aplica o conjunto de cancelamento devolvido. Solta a trava. Se nenhuma função ficou pendente, continua o laço sem pausar; senão devolve `Pause`
+  - **Fim (qualquer goroutine):** `Complete` toma a trava, confere geração do slot e marca de encerrada (diferente: descarta e volta), confere se o slot já foi resolvido (descarta), chama `x.Resolve(i, r)` ou `x.Abort(i, c, err)`, marca o slot e, para cada índice do conjunto de cancelamento devolvido, cancela o `ctx` daquele slot e chama `x.Abort(j, CauseCanceled, nil)` na hora, sem esperar a função voltar (H-08). Quando não resta pendente, solta a trava e chama `r.Schedule(token)`; `false` (requisição encerrada ou token velho) é ignorado
+  - **Retomada (worker):** `OnResume` continua o laço; o `Exchange` aplica o grupo (mudanças em ordem alfabética, negação do primeiro, `route_conflict`) e segue as fases
+  - **Determinismo:** o resultado não depende da ordem de término, porque todas as decisões são do `Exchange` (cancela só os posteriores, vence o primeiro em ordem alfabética, FDD 07). O executor só serializa as entregas
+  - **Desconexão:** `OnComplete` com pendência toma a trava, marca encerrada, chama `x.Disconnect()`, cancela o `ctx` de todos os slots devolvidos, solta a trava e chama `x.Complete()` (plugins rodam sem a trava). Entregas posteriores veem a marca ou a geração nova e são descartadas sem tocar o `Exchange`
+  - **Reaproveitamento seguro:** o estado só volta à lista livre depois de geração + 1 sob a trava; uma goroutine zumbi que ainda tem o ponteiro só lê a geração. O estado nunca é liberado enquanto referenciado (memória do Go)
+  - **O que é da FDD 18:** a goroutine, o `recover` (panic vira `Complete(_, CausePanic, err)`), o prazo (`Complete(_, CauseDeadline, ...)` no vencimento, mesmo com a função ainda rodando), rótulos de pprof, marca do `ctx` para `ErrRequestPath`, contagem de zumbis e de `max_inflight`, métricas `async` e falhas assíncronas
+  - **Cruzamentos:** uma retomada por grupo com `Go()`; o executor nunca pede `Schedule` por função
+  - **Mudanças pendentes sem alocar** (pergunta do ASSUNTO): ficam dentro do `Exchange` reaproveitado (vetor por instância, FDD 07), referenciando strings da arena do adaptador ou do `Result`, que valem até o `filter_destroy`, além do fim do grupo exigido pela FDD 05; no fim do grupo viram operações no registro de mudanças do `adapter.HeaderMap`, aplicado no Envoy ao liberar a direção (FDD 16). Limites: 16 mudanças por hook ou `Result` de uma instância (`proxy.MaxHeaderChanges`), até 64 instâncias por grupo (`sdkchain.MaxGroupWidth`); por requisição, o teto decorre disso (64 × 3 hooks × 16 = 3.072) e não há limite extra na v1 (hipótese H-26); o `Exchange` libera vetores acima de 256 mudanças no `Reset` para não reter memória (refino do contrato 10)
+
+**Exemplo de requisição** (grupo `authz/10` com `acl-a` e `acl-b`, as duas com `Go()`, ambas `closed`)
+```json
+{
+  "t=0ms": "OnRequestHeaders: StepAsync {0: acl-a, 1: acl-b}; Launch(0), Launch(1); Pause",
+  "t=3ms": "acl-a.Complete(DenyResult(Forbidden))",
+  "t=200ms": "acl-b ainda rodando (prazo de 200 ms)"
+}
+```
+
+**Exemplo de resposta**
+```json
+{
+  "Resolve(0, deny)": { "cancelar": [1], "Abort(1, canceled) na hora": true, "pendentes": 0 },
+  "Schedule(token)": true,
+  "t=3ms OnResume": "StepRespond: Forbidden de acl-a; Reply; Replied",
+  "acl-b": "ctx cancelado em t=3ms; resultado que chegar depois é descartado (slot resolvido)",
+  "se acl-b negasse primeiro": "Resolve(1, deny) não cancela ninguém; espera acl-a; se acl-a seguir, vence acl-b; se acl-a negar, vence acl-a",
+  "cruzamentos com cadeia": 3
+}
+```
+
+---
+
+**Contrato 8: recortes (`match`)**
+- Tipo: regra (pré-processada por `sdkchain.Compile` a partir de `config.Instance.Match`; avaliada pelo `Exchange`)
+- Assinatura/Rota: `plugins[].match.paths`, `plugins[].match.methods`, `plugins[].match.grpc_services` (FDD 15, contrato 1) → `sdkchain.Match{Paths, Methods, GRPCServices}`
+- Método: n/a
+- Semântica (aplicação das hipóteses H-14 da FDD 15):
+  - Campos presentes combinam por E; itens de uma lista combinam por OU; lista vazia ou ausente não restringe
+  - `paths`: prefixo de bytes do path atual, já normalizado pelo Envoy e com `SetRoute` aplicado, sem a query. O guia recomenda terminar o prefixo com `/` (`/api/` casa `/api/x`, não `/api`, nem `/apix`)
+  - `methods`: igualdade exata com `:method` (máscara de 9 bits); gRPC é sempre `POST`
+  - `grpc_services`: só requisição gRPC (`r.IsGRPC()`), com `:path` na forma `/<serviço>/<método>` e `<serviço>` igual ao item (conjunto pré-processado)
+  - **Momento:** cada instância é avaliada quando a cadeia chega ao grupo dela, no path daquele momento; as de fases não alcançadas e as da response usam o path final (FDD 07); `OnComplete` usa o path final
+  - **Custo:** instância fora do recorte não é chamada, não gera métrica nem log e custa só a comparação (até 20 ns por instância, hipótese H-18)
+  - **Segurança:** como o path chega normalizado (`normalize_path`, `merge_slashes`, `UNESCAPE_AND_REDIRECT`, FDD 26) e os prefixos estão em forma normalizada (FDD 15), `/api/../admin` não escapa de um recorte `/api/`
+  - **Recorte impossível:** com `paths` e `grpc_services` presentes, se nenhum prefixo pode casar com `/<serviço>/` de algum serviço da lista (nem o prefixo começa com `/<serviço>/`, nem `/<serviço>/` começa com o prefixo), a instância nunca roda. O executor loga `match_unreachable` (warn) na subida, uma vez por instância, e segue (hipótese H-28); a FDD 15 pode passar a avisar no `validate` (pedido)
+
+**Exemplo de requisição** (instância `rl-api` com `match: {paths: ["/api/"], grpc_services: ["pedidos.v1.Pedidos"]}`)
+```text
+GET /api/pedidos?x=1
+GET /api
+POST /pedidos.v1.Pedidos/Criar (gRPC)
+POST /api/pedidos.v1.Pedidos/Criar (HTTP/1.1, sem gRPC)
+```
+
+**Exemplo de resposta**
+```json
+{
+  "GET /api/pedidos?x=1": "fora: paths casa, mas grpc_services exige gRPC (E entre campos)",
+  "GET /api": "fora: prefixo /api/ não casa /api",
+  "POST /pedidos.v1.Pedidos/Criar gRPC": "fora: grpc_services casa, mas paths /api/ não casa /pedidos.v1...",
+  "POST /api/pedidos.v1.Pedidos/Criar": "fora: não é gRPC",
+  "conclusão": "com os dois campos, a instância nunca roda: o path de uma chamada gRPC é /<serviço>/<método> e não começa com /api/. O n3x.yaml de referência da FDD 15 tem esse recorte (I-10). Para 'HTTP em /api/ ou gRPC de pedidos.v1.Pedidos', use duas instâncias"
+}
+```
+
+---
+
+**Contrato 9: portas para as FDDs 18, 38, 25 e 29 (`Containment`, `ControllerProvider`, `SidecarParts`)**
+- Tipo: sdk (interfaces Go declaradas em `core/chain` e implementadas em `core/fault`, `core/grpcconn` e pelas FDDs 25 e 29; forma refinável por elas, hipótese H-21)
+- Assinatura/Rota:
+  ```go
+  package chain
+
+  // Implementada por core/fault (FDD 18).
+  type Containment interface {
+      Plugin(id plugin.ID, lim config.PluginLimits) (PluginContainment, error) // limites somados por plugin
+      Start()                   // Chain.Start: inicia as tarefas registradas, uma vez, em ordem de registro
+      Stop(ctx context.Context) // Chain.Stop: cancela as tarefas e espera até o prazo do ctx
+  }
+
+  type PluginContainment interface {
+      Instance(ref InstanceRef) (InstanceContainment, error) // antes do New
+  }
+
+  type InstanceRef struct {
+      ID       plugin.ID
+      Module   string               // origem gravada pelo builder (FDD 09)
+      Instance string
+      Phase    plugin.Phase         // zero na instância do core
+      Failure  plugin.FailurePolicy
+      Async    config.Async         // timeout e max_inflight
+      Log      *slog.Logger         // logger do core com plugin_id e instance
+      Events   *proxy.EventQueue    // fila do core (FDD 09) para panic, breaker_open e plugin_disabled; nil no standalone
+  }
+
+  type InstanceContainment interface {
+      // Partes do proxy.Env (D-09)
+      Background(name string, fn func(ctx context.Context))
+      Dial(ctx context.Context, network, address string) (net.Conn, error)
+      HTTPClient() *http.Client
+      Seal(m *telemetry.InstanceMetrics) // depois do New, com os handles da FDD 16
+
+      // Caminho da requisição
+      Admit(h proxy.Hook) sdkchain.Admission           // Guard.Before: disjuntor
+      Panicked(h proxy.Hook, v any)                    // Guard.Panicked: conta, stack amostrado, disjuntor
+      Failed(h proxy.Hook, c sdkchain.Cause, err error) // Guard.After com causa, hooks síncronos
+      Launch(a *Async) bool                            // contrato 7; false = overflow
+  }
+
+  // Implementada por core/grpcconn (FDD 38).
+  type ControllerProvider interface {
+      ForPlugin(id plugin.ID) func() (grpc.ClientConnInterface, error) // vira Env.Controller()
+      Install(u grpc.UnaryClientInterceptor, s grpc.StreamClientInterceptor) // interceptors do core, os mais internos (FDD 09)
+      Start()
+      Stop(ctx context.Context)
+  }
+
+  // Partes da visão proxy.Sidecar do core que não são do executor (FDD 09, contrato 5 e 8).
+  // Campo nulo usa o padrão do contrato 5.
+  type SidecarParts struct {
+      Identity    func() proxy.SidecarIdentity                    // FDD 25 (core/identity), com L-68 e L-69
+      Drain       func(q *proxy.EventQueue) <-chan struct{}       // FDD 29: recebe a fila para o drain_start e devolve o sinal
+      ExitContext func() (context.Context, context.CancelFunc)    // FDDs 29 e 38: ctx da chamada final, conexão viva
+  }
+  ```
+- Método: n/a
+- Semântica:
+  - **Guard do executor:** `Before` lê o relógio e chama `ic.Admit(h)`; `After` observa a duração (`ObserveHook`) quando houve chamada e, com causa diferente de 0 e de `CauseCanceled`, chama `ic.Failed(h, c, err)`; `Panicked` repassa a `ic.Panicked`; `Event` loga `hook_violation`, `route_conflict` ou `invalid_deny` amostrado (seção 7). O executor não conta falha nem panic: isso é da FDD 18 (`n3x_plugin_failures_total`, `n3x_plugin_panics_total`)
+  - **Falhas assíncronas:** a FDD 18 vê o `Result` e as causas dentro do `Launch` e conta lá; o executor só entrega ao `Exchange`
+  - **`CauseBreaker`, `CauseOverflow` e L-71:** o efeito vem de `sdkchain.Effect`; a FDD 18 fecha a L-71 (500 ou 503) e o rótulo de `CauseBreaker` mudando a tabela do `chain`, sem mudar o executor
+  - **Sem contenção:** `Options.Containment` nulo faz o `Build` em `ModeServe` falhar com `containment_missing`; testes e o harness de desenvolvimento usam `chaintest.Containment()` (goroutine, `recover` e prazo; sem disjuntor, `max_inflight`, zumbis nem métricas de falha) até a FDD 18 existir
+  - **Sem provedor do controller:** `Env.Controller()` devolve `(nil, proxy.ErrStandalone)`, que é o comportamento correto do modo standalone (FDD 06); a FDD 38 troca e passa a instalar os interceptors do core recebidos por `Install`
+  - **Fila de eventos:** criada pelo executor (contrato 5) e entregue à contenção por `InstanceRef.Events` e à drenagem por `SidecarParts.Drain`; os produtores usam só `Push`, que nunca bloqueia (FDD 09)
+  - **`SidecarParts`:** só dados e sinais que o executor não tem; quem monta o `proxy.CoreEnv` e a visão `Sidecar` é sempre o executor (FDD 09, tabela "Implementada em"). Os padrões permitem testar o core antes das FDDs 25, 29 e 38
+  - **`Privileged` (contrato 2):** a conferência de origem é sempre a do SDK (`proxy.CheckPrivileged`); a contenção e a conexão não a repetem
+
+**Exemplo de requisição**
+```go
+f := chain.NewFactory(reg, chain.Options{
+    Source:      chaintest.StaticSource(reg),
+    Containment: chaintest.Containment(),
+    Privileged:  chaintest.PrivilegedCheck(), // core mínimo de teste (H-29)
+})
+c, err := f.Build(chaintest.Host(envoyTarget, adapter.ModeServe, "/tmp/t/n3x.yaml", tel))
+f2 := chain.NewFactory(reg, chain.Options{Source: chaintest.StaticSource(reg), Privileged: chaintest.PrivilegedCheck()})
+_, err2 := f2.Build(chaintest.Host(envoyTarget, adapter.ModeServe, "/tmp/t/n3x.yaml", tel))
+_, err3 := f2.Build(chaintest.Host(envoyTarget, adapter.ModeValidate, "/tmp/t/n3x.yaml", tel))
+```
+
+**Exemplo de resposta**
+```json
+{
+  "err": null,
+  "err2": "(fábrica): contenção de falhas ausente (FDD 18) [containment_missing]",
+  "err3": null,
+  "nota": "em ModeValidate a contenção não é exigida, porque nada roda"
+}
+```
+
+---
+
+**Contrato 10: refinos pedidos ao SDK (`chain` da FDD 07 e `proxy` da FDD 09, série `v0.x`)**
+- Tipo: sdk (mudanças de API no `github.com/giustech/n3x-sdk/chain` e no `github.com/giustech/n3x-sdk/proxy`, permitidas enquanto o SDK estiver na `v0.x`)
+- Assinatura/Rota:
+  ```go
+  package chain // github.com/giustech/n3x-sdk/chain
+
+  // R1: gRPC decidido pelo driver (regra única do adaptador no sidecar; o kit usa a dele).
+  func (x *Exchange) Reset(g Guard, req HeaderMap, hasBody, isGRPC bool)
+
+  // R2: o driver não conseguiu juntar o body dentro do limite (o adaptador para de acumular).
+  func (x *Exchange) SetBodyOverLimit(size int64)
+
+  // R3: quem venceu a negação entregue por Deny(); ok = false se não houve negação.
+  type Denial struct {
+      Inst  *Inst
+      Hook  proxy.Hook // zero = função do Go()
+      Cause Cause      // 0 = negação do plugin; senão, falha que a política virou negação
+  }
+  func (x *Exchange) Denier() (Denial, bool)
+
+  // R4: largura do maior grupo da cadeia, para o driver dimensionar a tabela de funções.
+  func (c *Chain) MaxGroupLen() int
+  ```
+  ```go
+  package proxy // github.com/giustech/n3x-sdk/proxy
+
+  // R10: monta Config e Secrets de um PluginConfig (FDD 09, contrato 6) a partir da config
+  // crua da instância. Pura: sem I/O, sem chave e sem estado. meta traz ID, Instance, Phase,
+  // Order, Failure, Settings e Schema; Config e Secrets de meta são ignorados.
+  func NewPluginConfig(meta PluginConfig, raw []byte) (PluginConfig, error)
+  ```
+- Método: n/a
+- Semântica (sem mudança de comportamento para o kit, salvo o R1, que só move um parâmetro):
+  - **R5, `Guard.After` sem chamada:** quando a instância não é chamada (`SkipBreaker`, `body_limit` com `open`), o `chain` chama `After` com a causa e `Action` zero; `Before` só existe quando houve tentativa de chamada
+  - **R6, `Guard.Before` em `OnComplete`:** vale para `OnComplete` (hook síncrono); com `SkipBreaker`, a instância não recebe o fim
+  - **R7, entregas de outra goroutine:** `Resolve`, `Abort` e `Disconnect` podem ser chamados de qualquer goroutine desde que o driver serialize o acesso e nenhum `Run` esteja em curso; documentado no pacote
+  - **R8, retenção:** `Reset` libera vetores de mudanças com capacidade acima de 256 (hipótese)
+  - **R9, `Status()` no `OnComplete` depois de negação do N3X:** status HTTP nominal da negação efetiva, também em gRPC (H-10); caso novo em `conformance.RunChain`
+  - **Teste de paridade do R1:** o `n3x-sidecar` tem um teste de propriedade que confere, num corpus de `content-type`, que `adapter.IsGRPCContentType` e a regra do kit dão o mesmo resultado
+  - **R10, `proxy.NewPluginConfig` (pedido da FDD 07, P-14 dela; decisão desta FDD, hipótese H-30):** hoje o kit e o executor montariam o `PluginConfig` cada um com as mesmas funções de `plugin/` (`Schema.Normalize` sem opener, `Schema.Walk`, `plugin.SecretFingerprint`), o que é a mesma regra escrita duas vezes. Decisão: uma função pura no `proxy/`, dona do tipo (FDD 09), usada pelos dois. Regras: `Config` = `Schema.Normalize(raw)` sem opener, com o texto de todo segredo não vazio que não começa com `ENC[` trocado por `""`; `Secrets` na ordem do `Schema.Walk`, com `sealed` para texto que começa com `ENC[` (impressão digital de `plugin.SecretFingerprint` do texto), `in_clear` para outro texto não vazio e `empty` para vazio. A função não decifra nem importa `secret/` (o kit não pode, FDD 03); no executor a classificação por prefixo é exata, porque depois de um `config.Load` sem erro todo `ENC[...]` é um envelope válido que abriu (FDD 15). Erro só se `raw` não passar no schema (não acontece depois do `Load`). `ConfigInput.Sidecar` continua montado por cada runtime, porque o topo do `n3x.yaml` só existe no sidecar
+
+**Exemplo de requisição**
+```go
+x.Reset(st, r.Headers(), true, r.IsGRPC())
+// ... StepBody; o adaptador estourou o limite de 1 MiB
+x.SetBodyOverLimit(1_048_577)
+st := x.Run()
+d, ok := x.Denier()
+
+pc, err := proxy.NewPluginConfig(proxy.PluginConfig{ID: rl, Instance: "rl-api", Phase: plugin.PhaseTraffic, Order: 10, Failure: plugin.FailOpen, Schema: schemaRL},
+    []byte(`{"limit":100,"redis":{"address":"replica:6379","password":"ENC[v1:Q2hh...]"},"tokens":["n3x-canary-abc",""]}`))
+```
+
+**Exemplo de resposta**
+```json
+{
+  "st.Kind": "StepRespond",
+  "x.Deny()": { "status": 413, "code": "ResourceExhausted" },
+  "Denier": { "ok": true, "Inst": "waf", "Hook": "request_body", "Cause": "body_limit" },
+  "contagem": "n3x_plugin_denies_total não sobe (causa de falha); a FDD 18 conta n3x_plugin_failures_total{reason=\"body_limit\"}",
+  "pc.Config": "{\"limit\":100,\"redis\":{\"address\":\"replica:6379\",\"password\":\"ENC[v1:Q2hh...]\"},\"tokens\":[\"\",\"\"]}",
+  "pc.Secrets": [
+    { "Path": "redis.password", "State": "sealed", "Fingerprint": "51e0c3aa9b12" },
+    { "Path": "tokens[0]", "State": "in_clear", "Fingerprint": "" },
+    { "Path": "tokens[1]", "State": "empty", "Fingerprint": "" }
+  ]
+}
+```
+
+---
+
+**Contrato 11: harness de conformidade do sidecar (`chaintest.Harness`) e apoio de teste**
+- Tipo: sdk (API Go de teste em `core/chain/chaintest`, rodada pela CI do `n3x-sidecar`)
+- Assinatura/Rota:
+  ```go
+  package chaintest // github.com/giustech/n3x-sidecar/core/chain/chaintest
+
+  // Harness implementa conformance.Harness (FDD 07, contrato 10); Name() = "n3x-sidecar".
+  func Harness(opts ...Option) conformance.Harness
+
+  func WithContainment(c chain.Containment) Option          // padrão: Containment()
+  func WithController(p chain.ControllerProvider) Option    // padrão: nenhum (standalone)
+  func WithCore(module string, p proxy.Plugin) Option       // core real (FDD 36) com proxy.CheckPrivileged; padrão: CorePlugin()
+
+  // Core mínimo de teste, até o plugin core existir (FDD 36).
+  const CoreModule = "github.com/giustech/n3x-sidecar/core/chain/chaintest"
+  func CorePlugin() proxy.Plugin            // n3x.core mínimo: só de fundo, sem hooks, config vazia, ConnInterceptors que repassam
+  func PrivilegedCheck() chain.PrivilegedFunc // proxy.CheckPrivileged, aceitando só a origem (n3x.core, CoreModule) do core mínimo
+
+  func Containment() chain.Containment // referência de teste: goroutine, recover e prazo
+  func StaticSource(reg *chain.Registry, manifests ...[]byte) chain.SourceFunc
+  func Host(t proxy.Target, m adapter.Mode, configPath string, tel *telemetry.Runtime) adapter.Host
+  func Drain() (chain.SidecarParts, func(timeout time.Duration)) // parte Drain e o gatilho usado por Runtime.Drain
+
+  // Teste diferencial contra o harness do kit (sdktest).
+  func Diff(t *testing.T, seed uint64) // gera um caso pela semente, roda nos dois harnesses e compara
+  func AddDiffSeeds(f *testing.F)      // sementes fixas, inclusive os casos que já divergiram
+  ```
+- Método: n/a
+- Semântica:
+  - **`Start(t, Setup)`:** monta o registro com o core (`CorePlugin()` e `CoreModule`, ou o de `WithCore`) e os plugins do `Setup`, cada um com o `Module` do `Setup`; sintetiza um manifesto por ID (fases usadas pelas instâncias, padrões neutros, `module` igual ao do registro) e usa o schema de `ConfigSchema()`; escreve um `n3x.yaml` em `t.TempDir()` com `plugins[]` (fase, `order`, `failure`, `async.timeout`, `match` e `config`), `runtime.request_body.max_bytes`, `runtime.plugin_limits` e, com `Setup.Controller`, a seção `controller` a partir de `Setup.ControllerSettings` (o `controller.secret` cifrado com a chave de teste de `secret/secrettest` quando `Sealed()`, em claro quando `InClear()`); passa `Setup.Identity` em `SidecarParts.Identity`; chama `chain.NewFactory(...).Build(Host(...))` e depois `Start()`. Instância do `Setup` com ID `n3x.core` (o "core fingido" de `RunCore`) substitui o core mínimo, com o módulo do `Setup` e a conferência sem troca; instância com fase zero de outro plugin vira o vetor de recusa `privileged.background_only`
+  - **`Do(req)`:** usa o `Request` falso do `core/adapter/adaptertest` (FDD 16): entrega os cruzamentos na ordem do adaptador, espera `Schedule` (goroutines reais, relógio real), acumula body com `NeedBody`, simula a aplicação com `req.Response`, renderiza `Reply` com `sdkchain.Render` (referência do fio) e devolve o `Outcome`; `DisconnectAfterAsync` chama `OnComplete` com a pausa pendente
+  - **`Sidecar()`:** `chain.SidecarView(c)`, a mesma visão entregue ao core; **`Drain(timeout)`:** o gatilho de `chaintest.Drain()`, que fecha `Draining()` e empurra `drain_start` na fila, como fará o canal de controle da FDD 29
+  - **`Metric`:** publica a telemetria num `Sink` falso e lê; **`Logs`:** linhas do `Stderr` da telemetria; **`Advance`:** espera real (casos lentos pulados com `-short`); **`Shutdown`:** `Chain.Stop` com 2 s
+  - **Cobertura da suíte:** com `Containment()`, `conformance.RunChain` roda inteira (inclusive panic e prazo do `Go()`) e `conformance.RunCore` (no mínimo 15 casos, FDD 07, contrato 12) roda com o core mínimo; `conformance.RunEnv` entra quando as FDDs 18 e 38 trocarem a contenção e o controller (o mesmo harness, com `WithContainment(fault.New(...))` e `WithController(...)`). O caso de evento `panic` de `RunCore` depende do produtor da FDD 18: com a contenção de referência, o harness empurra o `panic` na fila pelo mesmo `InstanceRef.Events`, como a FDD 18 fará
+  - **Core real (pedido da FDD 07, P-14 dela):** quando o plugin core existir (FDD 36), `conformance.RunCore` roda também com `WithCore(plugin.CoreModule, coreagent.Plugin())` e `proxy.CheckPrivileged` sem troca, num teste do `n3x-sidecar` que importa o `n3x-plugin-core`; é o único lugar onde o par (ID, módulo) e o tipo dinâmico do core oficial passam juntos pela conferência fora do repositório do core
+  - **Teste diferencial:** um gerador de casos aleatórios (`ScriptPlugin` com roteiros, grupos, recortes, ordem de término e desconexão) roda cada caso no harness do kit (`sdktest`) e neste, e compara os `Outcome`; divergência reprova e salva o caso como semente (H-24)
+
+**Exemplo de requisição**
+```go
+func TestConformidade(t *testing.T) {
+    conformance.RunChain(t, chaintest.Harness())
+    conformance.RunCore(t, chaintest.Harness())
+}
+
+func TestConformidadeCoreReal(t *testing.T) { // depois da FDD 36
+    conformance.RunCore(t, chaintest.Harness(chaintest.WithCore(plugin.CoreModule, coreagent.Plugin())))
+}
+
+func FuzzDiferencial(f *testing.F) {
+    chaintest.AddDiffSeeds(f)
+    f.Fuzz(func(t *testing.T, seed uint64) { chaintest.Diff(t, seed) })
+}
+```
+
+**Exemplo de resposta**
+```text
+=== RUN   TestConformidade/chain/grupo_cancela_so_posteriores
+=== RUN   TestConformidade/chain/grpc_negacao_trailers_only
+=== RUN   TestConformidade/chain/oncomplete_status_negacao
+=== RUN   TestConformidade/core/conn_interceptors_fora_do_core
+=== RUN   TestConformidade/core/config_input_marcas
+--- PASS: TestConformidade (3.10s)
+    PASS: 32 casos de cadeia e 15 de core no harness n3x-sidecar
+--- PASS: TestConformidadeCoreReal (0.41s)
+--- PASS: FuzzDiferencial (600.00s)
+    fuzz: elapsed: 10m0s, execs: 812344, new interesting: 0
+```
+
+---
+
+### 6. Erros, exceções e fallback
+
+**Matriz de erros previstos e tratamentos**
+
+| Condição | Tratamento | Observações |
+| --- | --- | --- |
+| Registro inválido no `main` gerado (core ausente, nulo, ID inválido, `n3x.core` por `Plugin`, repetido, `Register` duas vezes) | Guardado na carga, sem panic; `Build` falha com a regra `registry_*`; o Envoy não sobe | Bug de geração (FDD 21); nunca derruba o `dlopen` |
+| Fonte do manifesto indisponível ou inválida | `manifest_unavailable` ou `manifest_read`; o Envoy não sobe | Até a FDD 22, todo `.so` de produção cai aqui; o harness usa a fonte estática |
+| Registro diferente do manifesto | `registry_missing`, `registry_unexpected` ou `schema_mismatch` | FR-004 "plugin exigido que não está no `.so`"; FDD 15 |
+| Módulo do registro diferente de `plugins[].module` | `privileged_origin` em `module`; um `privileged_refused`; o Envoy não sobe | Erro do builder ou artefato adulterado (FDD 09) |
+| Plugin que não é o core com metade só de fundo ou com `ConnInterceptors` | `privileged_capability`; o Envoy não sobe | FDD 09, contrato 2 |
+| `n3x.core` de outro módulo ou com tipo fora do módulo do core | `privileged_origin`; o Envoy não sobe | Barrado antes no build (`N3X-B007`, `N3X-B008`) |
+| Core sem `ConnInterceptors`, com interceptor nulo ou com hook | `core_capability_missing` ou `background_only_hooks`; o Envoy não sobe | Build quebrado do core (FDD 36) |
+| Panic dentro de `ConnInterceptors()` na subida | Contido; `core_capability_missing` | O core é obrigatório |
+| Fila de eventos cheia | Sai o mais antigo (`Dropped`), o novo entra; `Push` nunca bloqueia | Regra da `EventQueue` (FDD 09) |
+| Eventos não lidos no desligamento | Perdidos; log `core_events_lost` com a contagem por tipo | FDD 09 |
+| `n3x.yaml` inválido ou segredo que não confere | Um `config_problem` por problema e um `config_rejected`; o Envoy não sobe | Mesmo veredito do entrypoint (FDD 15) |
+| `Options.Containment` nulo em `ModeServe` | `containment_missing` | Impede `.so` sem contenção |
+| `InstanceTelemetry` recusa | `metric_reserved` ou `duplicate` | Namespace reservado (FDD 06) |
+| Config da instância recusada por `Instantiate` | Regras da FDD 02 com `plugins[i].config` | Na prática só `secret_open`, porque o `Load` já validou |
+| `New` com erro, `(nil, nil)`, panic ou acima de 5 s | `instance_failed` e `new_failed`, `new_nil`, `new_panic` ou `new_timeout`; selo feito; subida para | Nenhuma tarefa roda |
+| Hook síncrono dá panic | O `chain` contém, chama `Guard.Panicked` (FDD 18) e aplica a política | Em `OnComplete`, só conta |
+| Uso indevido do contrato no hook | O `chain` vira `Fail` com a sentinela; `hook_violation` amostrado | FDD 05, contrato 8 |
+| Negação inválida | 500 ou `INTERNAL`; `invalid_deny` amostrado | A negação vence |
+| Dois `SetRoute` no mesmo grupo de `access` ou `authn` | Vale o último em ordem alfabética; `route_conflict` amostrado | FDD 05 e FDD 15 (H-11) |
+| `Launch` sem vaga (`max_inflight`) | `Abort(i, CauseOverflow)` na hora; política da instância | Sem abrir goroutine (FDD 18) |
+| Função do `Go()` dá panic ou passa do prazo | A FDD 18 chama `Complete` com `CausePanic` ou `CauseDeadline` | O executor só entrega |
+| Resultado de `Go()` depois do fim ou de geração velha | Descartado sem tocar o `Exchange` | Zumbi; a FDD 18 conta |
+| Cliente desconecta com `Go()` ou body pendente | `Disconnect`, cancelamento dos `ctx`, `Complete` com `Status()` 0 | Sem retomada |
+| `Schedule` devolve falso | Ignorado | A requisição já terminou |
+| Body acima do limite | `SetBodyOverLimit`; `closed` nega com 413 ou `RESOURCE_EXHAUSTED`; `open` segue sem o hook (`body_limit`) | FDDs 05 e 16 |
+| Instância com hook de body num alvo sem `request_body` | Hook nunca chamado; `hook_unsupported` na subida | No `envoy-1.40` não acontece |
+| Lista livre vazia | Aloca um estado novo (fora do regime) | Cresce até a concorrência real |
+| Bug do executor (panic fora do `chain`, veredito inválido) | Rede de proteção do adaptador: 500 ou `INTERNAL`, `n3x_sidecar_core_errors_total` | FDD 16 |
+| Headers resultantes acima do limite do Envoy para o upstream | O Envoy responde erro ao cliente | Fora do executor (FDD 26) |
+
+**Estratégias de resiliência**
+- **Timeouts:** 5 s por `Instantiate` na subida; `Chain.Start` em até 10 ms (só dispara goroutines); `Chain.Stop` até o prazo do `ctx` (`ShutdownGrace`, 2 s); prazo do `Go()` aplicado pela FDD 18 com `plugins[].async.timeout`; prazos da requisição são do Envoy (FDD 26)
+- **Retries e backoff:** o executor não repete nada; reinício de tarefa de fundo é da FDD 18
+- **Circuit breaker:** disjuntor por instância da FDD 18, consultado em todo hook por `Guard.Before`
+- **Estruturais:** decisões só no `chain` (paridade com o kit); entregas serializadas por trava por requisição; geração em todo estado e slot; lista livre sem GC; registro sem panic na carga; composição explícita em `core/entry`
+
+**Política de fallback**
+- Não há fallback silencioso: problema de subida impede o Envoy de subir (FR-004); `.so` sem contenção não sobe
+- Na requisição, toda falha passa pela política da instância (`open` ou `closed`); a negação vence sempre
+- O harness de desenvolvimento nunca é aceito pelo entrypoint de produção
+
+**Invariantes**
+- Toda decisão de cadeia é do `sdkchain.Exchange`; o executor não tem algoritmo de fase, grupo, recorte ou negação
+- `Build` roda no máximo uma vez por processo; nenhuma tarefa de fundo roda antes do `Start` nem numa subida que falhou
+- Toda instância é selada (métricas, memória e tarefas) antes de a subida continuar, inclusive quando o `New` falha
+- Só a instância `core` de `n3x.core`, com origem aprovada, recebe `proxy.CoreEnv`; existe exatamente uma por processo, também no standalone
+- Toda instância passa por `proxy.CheckPrivileged` com o par (ID, módulo) do registro, que é igual ao do manifesto embutido
+- Nenhum texto de segredo em claro aparece em `ConfigInput`; `controller.secret` nunca aparece em `ConfigInput.Sidecar` (FDD 09)
+- Em `ModeValidate`, nenhum `New`, nenhuma tarefa, nenhum valor de segredo aberto e nenhuma conexão
+- O executor devolve exatamente um veredito por cruzamento, sempre aceito pela tabela da FDD 16
+- `OnComplete` roda exatamente uma vez para toda instância do recorte que implementa o hook e não está com o disjuntor aberto
+- Nenhuma entrega de `Go()` toca o `Exchange` depois do fim da requisição ou com geração diferente
+- No máximo um `Schedule` por grupo com `Go()`
+- O estado por requisição só volta à lista livre com geração nova
+- Nenhum log do executor contém path, header, query, body, mensagem de negação ou segredo
+
+---
+
+### 7. Observabilidade
+
+**Métricas** (publicadas pela telemetria do `.so`, FDD 16; rótulos sem dado da requisição)
+- `n3x_plugin_duration_seconds{plugin, instance, phase, hook}` (histogram, `DefaultBuckets`, `_bucket` e `_count`): o executor alimenta os hooks síncronos (`request_headers`, `request_body`, `response_headers`, `complete`) por `InstanceMetrics.ObserveHook` no `Guard.After`, só quando houve chamada; `async` é da FDD 18
+- `n3x_plugin_denies_total{plugin, instance, code}` (counter): uma por negação vencedora de plugin (`x.Denier()` com causa 0), na instância vencedora, `code` igual ao status HTTP nominal efetivo; negação por política `closed` não conta aqui (H-19)
+- `n3x_plugin_memory_bytes{plugin}`, `n3x_plugin_memory_max_bytes{plugin}` (gauges) e `n3x_plugin_memory_evictions_total{plugin}` (counter): pelo coletor de memória do contrato 5, a cada publicação (1 s)
+- `n3x_config_secrets_in_clear` (gauge): `Platform().SetSecretsInClear(rep.SecretsInClear)` uma vez no `Build`
+- **Nova:** `n3x_sidecar_chain_inflight` (gauge, sem rótulos): estados por requisição em uso (fora da lista livre); volta a 0 sem tráfego (hipótese H-17; pedido à FDD 16 para a família no `Platform`)
+- `n3x_sidecar_events_total{kind}`, `n3x_sidecar_events_suppressed_total{kind}`, `n3x_sidecar_events_dropped_total{kind}` e `n3x_sidecar_events_pending` (definidas na FDD 09, publicadas pela FDD 16): o executor, dono da fila, registra o coletor que lê `EventQueueStats` a cada publicação
+- Os cruzamentos são medidos por `n3x_sidecar_entries_total{event, kind}` da FDD 16, que valida o objetivo de cruzamentos
+
+**Logs** (JSON em stderr pelo escritor sem bloqueio da FDD 16; campos fixos `ts`, `level`, `component`, `service`, `msg`, `plugin_id`, `instance`, `request_id`; `component=core`)
+
+| Evento (`msg`) | Nível | Campos | Quando |
+| --- | --- | --- | --- |
+| `config_problem`, `config_rejected`, `config_loaded`, `config_warning` | error, error, info, warn | os da FDD 15 (sem `exit_code` no `.so`) | Subida; avisos uma vez por processo (H-26 da FDD 15) |
+| `memory_quota` | info | `plugin_id`, `max_bytes`, `source` | Um por plugin (FDD 04) |
+| `plugin_limits` | info | `plugin_id`, `max_tasks`, `max_conns`, `source` | Um por plugin (FDD 06) |
+| `plugin_hooks` | info | `plugin_id`, `instance`, `phase`, `order`, `failure`, `hooks`, `matched` (tem recorte), `target` | Um por instância (FDD 05, com campos novos) |
+| `hook_unsupported`, `plugin_without_hooks` | warn | os da FDD 05 | Um por aviso do `Compile` |
+| `privileged_granted` | info | `plugin_id`, `instance`, `module`, `capabilities` | Uma vez por processo, quando o core passa (FDD 09) |
+| `privileged_refused` | error | `plugin_id`, `module`, `capability`, `rule`, `path`, `detail` | Um por problema de origem ou privilégio, na subida (FDD 09) |
+| `core_events_lost` | warn | contagem por tipo (`panic`, `breaker_open`, `plugin_disabled`, `config_error`, `drain_start`, `secret_in_clear`) | No `Stop`, se havia eventos não lidos (FDD 09) |
+| `match_unreachable` | warn | `plugin_id`, `instance` | Recorte que nunca casa (contrato 8), uma vez por instância |
+| `instance_failed` | error | `plugin_id`, `instance`, `path`, `rule`, `detail`, `stack` (só panic) | Subida que falhou |
+| `chain_compiled` | info | `instances`, `implicit`, `groups`, `layout`, `duration_ms` | Uma por processo, em `ModeServe` |
+| `chain_validated` | info | `instances`, `duration_ms` | Uma por processo, em `ModeValidate` |
+| `dev_registry` | warn | `plugins`, `detail` | A cada `Build` do harness de desenvolvimento |
+| `memory_oversize` | warn | `plugin_id`, `map`, `count`, `max_bytes` | No máximo 1 por minuto por plugin (FDD 04) |
+| `hook_violation` | warn | `plugin_id`, `instance`, `phase`, `hook`, `rule`, `request_id` | No máximo 1 por segundo por instância (FDD 05) |
+| `route_conflict` | warn | `plugin_id`, `instance`, `phase`, `request_id` | No máximo 1 por segundo por instância (FDD 05) |
+| `invalid_deny` | warn | `plugin_id`, `instance`, `phase`, `hook`, `request_id` | No máximo 1 por segundo por instância |
+| `request_denied` | info | `plugin_id`, `instance`, `phase`, `hook` (`async` no `Go()`), `status`, `grpc_status` (só gRPC), `request_id`, `suppressed` | No máximo 1 por segundo por instância; `suppressed` conta as negações não logadas desde a última linha (hipótese H-16) |
+
+- `layout` do `chain_compiled`: grupos em ordem de execução no formato `<fase>/<order>[<instância>,...]`, separados por espaço; nunca a `config` nem os valores de `match`
+- Nunca registra path, header, query, body, mensagem de negação, valor de config ou segredo; o `detail` de `instance_failed` traz o texto do erro do plugin, cortado em 1 KiB (H-23)
+- A amostragem usa um carimbo atômico por instância e evento (0 alocações quando descarta)
+
+**Tracing**
+- Sem tracing distribuído na v1 (ADR-009 do `n3x-sdk`); correlação por `request_id` nos logs e por `x-request-id` no fio (L-13)
+- O executor não cria goroutine no caminho síncrono; as goroutines do `Go()` levam os rótulos de pprof da FDD 18; a de `memory.Runtime.Run` leva `component=memory`; a do `Instantiate` na subida leva `component=core`, `plugin` e `instance`
+
+**Dashboards e alertas**
+- Painel de referência (FDD 47): negações por instância e `code`; p50 e p99 de `n3x_plugin_duration_seconds` por `hook`; cruzamentos por requisição (FDD 16); `n3x_sidecar_chain_inflight`; memória por plugin
+- Alertas sugeridos:
+  - vazamento de estado: `n3x_sidecar_chain_inflight > 0` com `rate(n3x_sidecar_entries_total{event="filter_new"}[10m]) == 0` por 10 minutos (aviso; hipótese)
+  - hooks lentos: p99 de `n3x_plugin_duration_seconds{hook!="async"}` acima de 0,10 ms por 15 minutos (FDD 05)
+  - bug do core: `rate(n3x_sidecar_core_errors_total[5m]) > 0` (crítico, FDD 16)
+  - subida quebrada: container em reinício com `msg="filter_config_rejected"`, `msg="instance_failed"` ou `msg="privileged_refused"` no log (FDD 47)
+  - eventos do core perdidos: `rate(n3x_sidecar_events_dropped_total[5m]) > 0` (aviso; a tarefa do core travou, FDD 09)
+  - memória: `n3x_plugin_memory_bytes / n3x_plugin_memory_max_bytes > 0.9` por 15 minutos (informativo)
+
+---
+
+### 8. Dependências e compatibilidade
+
+| Componente | Versão mínima | Observações |
+| --- | --- | --- |
+| Go | 1.26 | cgo, `-buildmode=c-shared` (ADR-008 do `n3x-sidecar`) |
+| `n3x-sdk` `chain` (FDD 07) | mesma versão do `.so`, com os refinos do contrato 10 | Motor da cadeia; importado como `sdkchain` |
+| `n3x-sdk` `proxy`, `plugin`, `memory`, `telemetry` (FDDs 01 a 06) | mesma versão do `.so` | `Plugin`, `Env`, `HooksOf`, `ID`, `Phase`, `Manifest`, `memory.Runtime`, `Metrics.Seal` |
+| `n3x-sdk` privilegiadas do core (FDD 09) | mesma versão do `.so`, com `proxy.NewPluginConfig` (contrato 10) | `plugin.CoreID`, `plugin.CoreModule`, `plugin.IsCoreOrigin`, `proxy.CheckPrivileged`, `proxy.CoreEnv`, `proxy.Sidecar`, `proxy.ConfigInput`, `proxy.EventQueue`, `proxy.ConnInterceptorProvider`, `proxy.CoreInstance`, `proxy.ExitTimeout` |
+| `n3x-sdk` `sdktest/conformance` e `sdktest` (FDD 07) | mesma versão | Só em teste e no harness de desenvolvimento (`ScriptPlugin`) |
+| `n3x-sdk` `yamlconv` (FDD 01) | mesma versão | Só no harness de desenvolvimento (`RegisterDev`) |
+| `core/config` (FDD 15) | mesmo `core/` | `Load`, `VerifyRegistry`, `NewStaticSource`, `NewPluginInfo`, `Instance`, `Report`, `PluginLimits` |
+| `core/adapter`, `core/adapter/active`, `core/adapter/adaptertest` (FDD 16) | mesmo `core/` | `Factory`, `Chain`, `Host`, `Request`, `HeaderMap`, `Verdict`, `Body`, `Token`, `IsGRPCContentType`; `active` só em `core/entry` |
+| `core/telemetry` (FDD 16) | mesmo `core/` | `Configure`, `InstanceTelemetry`, `Platform`, `AddCollector`, `CoreLogger`; família nova `n3x_sidecar_chain_inflight` |
+| `core/fault` (FDD 18) | mesmo `core/` | Implementa `Containment`; obrigatório para o `.so` de produção |
+| Leitor do `.n3x_manifest` (FDD 22) | mesmo `core/` | Fonte de produção (schemas, `plugins[].module` e bytes do manifesto); até ela, stub |
+| `core/grpcconn` (FDD 38) | mesmo `core/` | Implementa `ControllerProvider` e instala os interceptors do core; até ela, standalone |
+| `core/identity` (FDD 25) e drenagem (FDD 29) | mesmo `core/` | `SidecarParts.Identity` e `SidecarParts.Drain`; até elas, os padrões do contrato 5 |
+| Plugin core (FDDs 09 e 36) | versão fixada pela imagem de build | `entry.Core(plugin.CoreModule, core.Plugin())`; antes da FDD 36, `chaintest.CorePlugin()` com `chaintest.PrivilegedCheck()` nos testes e no harness |
+| `n3x-builder` (FDD 21) | consumidor | Gera o `main` do contrato 1, com ID e módulo de cada plugin; nunca passa a tag `n3x_dev` |
+| Envoy `v1.40.x` e imagem do alvo | por digest (fase 0) | Harness de desenvolvimento e testes golden em Envoy real |
+
+**Garantias de compatibilidade**
+- `core/entry` (`Register`, `Core`, `Plugin`, `Registration`) congelado na major do módulo `core/`; mudança só por adição; o `main` de referência da FDD 21 fica como golden em `core/entry/testdata` e compila em toda CI
+- A imagem de build é 1:1 com a versão do `core/` (HLD do `n3x-builder`), então o gerador sempre corresponde ao contrato que compila
+- O `.so` não depende da ordem em que o `main` escreve os plugins; o registro é ordenado por ID
+- Regras de subida (`registry_*`, `new_*`, `containment_missing`, `metric_reserved`) são códigos estáveis na major do `core/`; regra nova só por minor. As regras de origem e privilégio são as da FDD 09, congeladas na major do SDK
+- Portas do contrato 9 e a API de `core/chain` fora de `core/entry` são uso interno do módulo `core/` e podem mudar por minor junto com `core/fault` e `core/grpcconn` (H-25)
+- Os refinos do contrato 10 entram no SDK na série `v0.x`; depois da `v1.0.0`, mudam só pela tabela do contrato 9 da FDD 05 e do contrato 11 da FDD 07
+- Mudança de comportamento da cadeia vem sempre pelo `chain` do SDK, e muda o kit e o executor juntos
+
+---
+
+### 9. Critérios de aceite técnicos
+
+- **TDD:** os pacotes `core/chain` e `core/entry` nascem com os testes antes do código (constituição do repositório); cobertura de linhas de no mínimo 90% em `core/chain` e `core/entry` (hipótese, igual às FDDs anteriores)
+- **Contrato do `main` (L-03):** o golden `core/entry/testdata/main_core_example_ratelimit.go` compila com `-buildmode=c-shared -tags n3x_envoy140`; sem a tag, falha com o identificador da FDD 16; `go list -deps` do golden não lista `core/chain/chaintest` nem arquivos com a tag `n3x_dev`; uma busca na CI confirma que o golden não tem `func init`, `//export` nem outra chamada além de `entry.Register`
+- **Registro:** teste de tabela com uma linha por regra 1 a 7 do contrato 3 (`registry_core_missing`, `registry_nil`, `id_format`, `registry_core_id`, `duplicate`, `registry_twice`, `registry_module`), conferindo `Path` e `Rule`; nenhum caso faz panic na chamada de `Register`
+- **Subida:** testes de tabela para as regras 8 a 22 com `chaintest.Host` e `n3x.yaml` em `t.TempDir()`; panic no `New` dá `new_panic` com `stack`; `New` que dorme 6 s dá `new_timeout` em até 5,1 s; numa subida que falha, 0 tarefas começam e todo escopo de memória está selado (`NewMap` depois dá panic)
+- **Privilégios (vetores da FDD 09, lado do sidecar):** com o `proxy.CheckPrivileged` real, um plugin `acme.x` com `ConnInterceptors` dá `privileged_capability` em `plugins["acme.x"].privileged.conn_interceptors`; `acme.bg` sem fase dá `privileged_capability` em `privileged.background_only`; `n3x.core` com módulo `github.com/acme/n3x-plugin-core` dá `privileged_origin` em `module`; core com tipo declarado fora do módulo dá `privileged_origin` em `instance`; core sem `ConnInterceptors` ou com interceptor nulo dá `core_capability_missing`; core com `OnRequestHeaders` dá `background_only_hooks`; módulo do registro diferente do manifesto dá `privileged_origin`; cada caso com um `privileged_refused` e `errors.Is(err, proxy.ErrPrivileged)`; `env.(proxy.CoreEnv)` é falso para o `n3x.example` e verdadeiro só para o core
+- **`ConfigInput` e eventos (FDD 09):** para o exemplo do contrato 6 da FDD 09, `Secrets` sai igual (`sealed` com a impressão digital de `plugin.SecretFingerprint`, `in_clear`, `empty`), o texto em claro vira `""` e o canário `n3x-canary-` não aparece em nenhum byte de `ConfigInput` nem o `controller.secret` em `ConfigInput.Sidecar` (`secrettest.Leaks`); o executor e o kit produzem `PluginConfig` iguais para o mesmo caso (mesma `proxy.NewPluginConfig`); com segredo em claro, o primeiro `NextEvent` do core é `secret_in_clear` com o caminho absoluto, e um aviso `key_too_open` vira `config_error`; no standalone, `NextEvent` devolve `ErrStandalone` e não há fila
+- **Core e conformidade do core:** `conformance.RunCore(t, chaintest.Harness())` passa com no mínimo 15 casos (FDD 07, contrato 12); depois da FDD 36, `RunCore` passa também com `chaintest.WithCore(plugin.CoreModule, coreagent.Plugin())` e `proxy.CheckPrivileged` sem troca (pedido P-14 da FDD 07); com a config do filtro criada duas vezes no mesmo processo, o `New` do core roda uma vez e `ConnInterceptors()` é chamado uma vez (FDD 09)
+- **`ModeValidate`:** `Build` não chama `New` (contador no plugin de teste fica 0), não cria conta de memória, não chama `Start`, não abre segredo de config de plugin (opener de teste nunca chamado) e termina em até 50 ms com a config de referência; com controller de teste ligado, 0 `Login` e 0 `Register` (com a FDD 16)
+- **Ordem e selo:** com core, exemplo e um plugin que registra 2 tarefas, as tarefas começam só no `Start`, as do core primeiro, uma vez cada; `env.Background` depois do `New` dá panic `ErrSealed`; `memory_quota` e `plugin_limits` saem uma vez por plugin, inclusive para o `n3x.core`
+- **Instância do core:** com o manifesto do core `phases: []`, existe exatamente uma instância `core` do `n3x.core`, sem fase, fora do `chain_compiled.layout`, com config `{}` e limites de `runtime.plugin_limits["n3x.core"]`, também no standalone; ela nunca recebe hook de requisição
+- **Conformidade:** `conformance.RunChain(t, chaintest.Harness())` passa com no mínimo 30 casos, sem `-short`; o caso novo de `Status()` no `OnComplete` depois de negação passa no kit e no sidecar
+- **Teste diferencial:** 1.000 casos aleatórios por PR e 100.000 na CI noturna dão `Outcome` igual no harness do kit e no do sidecar (H-24)
+- **Determinismo do grupo:** grupo `authz/10` com 3 instâncias com `Go()` que terminam em ordem real aleatória dá o mesmo resultado (negação vencedora e headers à aplicação) em 1.000 execuções; nos 6 cenários de quem nega primeiro, só as posteriores são canceladas e o `ctx` delas é cancelado em até 1 ms depois da negação
+- **0 alocações** (`testing.AllocsPerRun(1000, ...)`, ponte falsa do `adaptertest`, sem `-race`): requisição completa da config de referência em HTTP e gRPC; negação na request (HTTP e gRPC) e na response; instância fora do recorte; hook de body com buffer do pool; `OnComplete` com 3 instâncias; laço com `RouteChanged`
+- **Custo:** benchmark `BenchmarkReferencia` com no máximo 3 µs por requisição no p50 no runner da CI (hipótese); 50 instâncias fora do recorte acrescentam no máximo 1 µs e 0 alocações; o p50 e o p99 no Envoy real ficam com a FDD 50 (até 0,05 ms e 0,10 ms sobre "adaptador mais cadeia vazia")
+- **Cruzamentos:** com a ponte falsa contando cruzamentos com cadeia, 3 por requisição na config de referência, 2 numa negação na request sem body (headers e fim, como na tabela da FDD 16), 5 com body num pedaço e um grupo com `Go()`; iguais com 1 e com 50 instâncias; nenhum caso com dois `Schedule` para o mesmo grupo
+- **`OnComplete`:** teste de propriedade sobre o corpus do fuzzing: cada instância do recorte com o hook recebe exatamente 1 `OnComplete`, inclusive em negação, falha, `Go()` pendente e desconexão; instância fora do recorte recebe 0; instância com disjuntor aberto (contenção de teste que devolve `SkipBreaker`) recebe 0
+- **Fuzzing de desconexão:** `FuzzDesconexao` roda 10 minutos na CI noturna com roteiros aleatórios, desconexão em pontos aleatórios (durante `Go()`, `NeedBody` e response) e atrasos aleatórios: 0 panic, 0 entrega depois do fim, `n3x_sidecar_chain_inflight` volta a 0 ao final
+- **Corrida:** teste com `-race` de 1.000.000 de `Complete` concorrentes com `OnComplete` e reaproveitamento do estado: nenhum acesso ao `Exchange` depois do fim, nenhuma corrida apontada
+- **Golden em Envoy real** (harness de desenvolvimento, `dev/compose.yaml`, imagem exata do catálogo, amd64): o `n3x.example` acrescenta `X-N3X: 1` e nega `/admin/` em HTTP/1.1, HTTP/2 e gRPC; a negação gRPC chega com HTTP 200, `grpc-status: 7` (`PERMISSION_DENIED`), trailers-only e nunca `grpc-status: 0`; um `ScriptPlugin` com `Go()` de 50 ms retoma e entrega; cliente que desconecta durante o `Go()` gera 1 `OnComplete` e nenhuma retomada; arm64 fica com a matriz (FDDs 46 e 48)
+- **Recortes:** teste de tabela com os 4 casos do contrato 8 e com `paths`, `methods` e `grpc_services` isolados e combinados; o recorte de referência da FDD 15 (`paths: ["/api/"]` com `grpc_services: ["pedidos.v1.Pedidos"]`) gera `match_unreachable`; `paths: ["/pedidos.v1.Pedidos/"]` com o mesmo serviço não gera
+- **Rota:** `SetRoute` em `route` muda o `:path` recebido pela aplicação e o recorte de uma instância em `authz` passa a usar o path novo; `r.RouteChanged()` chamado exatamente uma vez por liberação com mudança e 0 vezes sem
+- **Métricas:** depois de 1.000 requisições negadas pelo exemplo, `n3x_plugin_denies_total{plugin="n3x.example",instance="add-header",code="403"}` vale 1.000; `n3x_plugin_duration_seconds_count{hook="request_headers"}` vale o número de chamadas; `n3x_config_secrets_in_clear` igual a `Report.SecretsInClear`; métricas de memória mudam no `/metrics` em até 2 s; `n3x_sidecar_chain_inflight` volta a 0 sem tráfego
+- **Logs:** golden de cada evento da seção 7; `request_denied` com 100 negações no mesmo segundo gera 1 linha com `suppressed` igual a 99 na seguinte; canário `n3x-canary-` num segredo de config e num erro de `New` que formata o `plugin.Secret` nunca aparece em stderr (`secrettest.Leaks`, FDD 03); nenhuma linha traz path, header ou mensagem de negação
+- **Harness de desenvolvimento:** `go build` de `core/entry` sem a tag `n3x_dev` não tem `RegisterDev` (teste de compilação); o teste de deriva compara `cmd/libn3x-dev/manifests/*.yaml` com o `n3x-plugin.yaml` dos módulos e passa
+- **Dependências:** `go list -deps ./core/chain` não lista o SDK Go do Envoy, `core/adapter/envoy140` nem `core/adapter/active`; só `core/entry` lista `active`; `go vet` e `go test -race ./core/chain/... ./core/entry/...` passam
+
+---
+
+### 10. Riscos e mitigação
+
+### Iteração de filtros prende ou corrompe a requisição
+
+- **Probabilidade:** média
+- **Impacto:** requisições presas até o prazo do Envoy ou mudanças de header perdidas (risco do PRD)
+- **Mitigação:**
+    - TDD no executor; decisões só no `chain`, com a mesma suíte do kit (`RunChain`) e teste diferencial kit contra sidecar
+    - Teste de propriedade de seguir, parar, retomar e grupos; golden em Envoy real
+    - Prazo em todo `Go()` (FDD 18) e prazos do Envoy (FDD 26)
+- **Plano de contingência:** os prazos do Envoy encerram a requisição; o caso vira semente do teste diferencial; o plugin envolvido sai do `n3x.yaml` até a correção
+
+### Negação gRPC chega como sucesso
+
+- **Probabilidade:** alta (a resposta local do Envoy converte o status com tabela própria, FDD 16)
+- **Impacto:** cliente gRPC trata a negação como `OK`
+- **Mitigação:**
+    - Toda negação passa por `x.Deny()` (resposta já efetiva) e `r.Reply`; o executor nunca monta resposta
+    - Golden em Envoy real com `grpc-status: 7` e nunca 0; conformidade da FDD 16 com os códigos que o Envoy mapearia diferente
+- **Plano de contingência:** release bloqueada (PRD); correção no mecanismo do adaptador (FDD 16)
+
+### Grupo paralelo com resultado diferente entre execuções
+
+- **Probabilidade:** média
+- **Impacto:** a mesma requisição é negada ou aceita conforme quem termina primeiro
+- **Mitigação:**
+    - Entregas serializadas por trava e decisões do `Exchange` (cancela só os posteriores, vence o primeiro em ordem alfabética)
+    - Teste de 1.000 execuções com ordem aleatória e teste diferencial
+- **Plano de contingência:** entregar os resultados só no worker, em ordem de índice, depois de todas as funções terminarem (perde o cancelamento antecipado, mantém o determinismo)
+
+### Corrida entre a goroutine do `Go()` e o reaproveitamento do estado
+
+- **Probabilidade:** média
+- **Impacto:** corrupção de outra requisição ou crash do Envoy
+- **Mitigação:**
+    - Geração em cada estado e slot, marca de encerrada e trava por requisição
+    - Teste com `-race` de 1.000.000 de entregas e fuzzing de desconexão de 10 minutos
+- **Plano de contingência:** desligar o reaproveitamento de estados com `Go()` pendente (estado vai ao GC em vez da lista livre) até a correção
+
+### Contrato do `main` gerado muda depois da FDD 21
+
+- **Probabilidade:** média
+- **Impacto:** imagens de build antigas geram código que não compila contra um `core/` novo
+- **Mitigação:**
+    - `core/entry` congelado na major, só adição; golden do `main` compilado em toda CI do `n3x-sidecar`
+    - Imagem de build 1:1 com a versão do `core/` (HLD do `n3x-builder`)
+- **Plano de contingência:** função nova (`RegisterWith`) mantendo a antiga até a próxima major do `core/`
+
+### Orçamento estourado por usar o `chain` público do SDK
+
+- **Probabilidade:** média
+- **Impacto:** a parcela "core do `.so`" passa de 0,15 ms no p50, ou aparecem alocações
+- **Mitigação:**
+    - Benchmarks com `-benchmem` no SDK e no executor como portão; lista livre sem GC; `HeaderMap` do adaptador usado direto como `sdkchain.HeaderMap`
+    - Medição no Envoy real pela FDD 50
+- **Plano de contingência:** implementação própria no executor mantida em paridade pela suíte de conformidade e pelo teste diferencial (opção b da L-50, FDD 07)
+
+### Dependências não implementadas no momento da sessão S12
+
+- **Probabilidade:** alta (planejamento: FDDs 18, 22, 36 e 38 vêm depois)
+- **Impacto:** o `.so` de produção não sobe só com a FDD 17
+- **Mitigação:**
+    - Portas com padrões seguros: fonte stub (`manifest_unavailable`), controller standalone, contenção obrigatória (`containment_missing`)
+    - Harness de desenvolvimento e `chaintest` para testar tudo em Envoy real sem builder, sem manifesto e sem o plugin core
+- **Plano de contingência:** antecipar a FDD 18 para a mesma janela se o marco M2 apertar
+
+### Harness de desenvolvimento diverge do `.so` real
+
+- **Probabilidade:** média
+- **Impacto:** teste passa no harness e falha no `.so` do builder (manifesto de cópia, schema sem conferência)
+- **Mitigação:**
+    - Mesma fábrica e mesma composição, salvo a fonte; teste de deriva das cópias dos manifestos
+    - Tag `n3x_dev` fora do builder e log `dev_registry`; o entrypoint recusa `.so` sem manifesto
+- **Plano de contingência:** depois da FDD 21, rodar os golden também com o `.so` gerado pelo builder (FDD 48)
+
+### `New` lento ou bloqueado trava a subida
+
+- **Probabilidade:** baixa
+- **Impacto:** Envoy não fica pronto e o container reinicia em laço
+- **Mitigação:**
+    - Prazo de 5 s por `Instantiate` com `new_timeout` e a instância citada no log
+    - `New` sem I/O de rede (FDD 06) e análise estática (FDD 24)
+- **Plano de contingência:** prazo do Envoy pronto em 30 s (FDD 27) encerra o container com a causa no log
+
+### Troca da conferência de origem vaza para produção ou o core mínimo diverge do core real
+
+- **Probabilidade:** baixa
+- **Impacto:** um `.so` aceitaria capacidade privilegiada fora do core oficial, ou o harness passaria com um core que o runtime real recusaria
+- **Mitigação:**
+    - `Options.Privileged` só é trocado por `chaintest` e por `RegisterDev` (tag `n3x_dev`); `entry.Register` sempre usa `proxy.CheckPrivileged`, conferido por teste que inspeciona a composição de produção
+    - `chaintest.PrivilegedCheck()` aceita uma única origem de teste e aplica todas as outras regras da FDD 09
+    - `conformance.RunCore` com o core real assim que a FDD 36 existir (pedido da FDD 07)
+- **Plano de contingência:** publicar cedo um `n3x-plugin-core` mínimo (só a metade de proxy com `ConnInterceptors`) e tirar a troca dos testes (P-05)
+
+### Dependências da visão `Sidecar` não implementadas (FDDs 22, 25, 29 e 38)
+
+- **Probabilidade:** alta (ordem das FDDs)
+- **Impacto:** o core recebe identidade parcial, manifesto vazio e drenagem que nunca chega até as FDDs donas existirem
+- **Mitigação:**
+    - Padrões explícitos por campo (contrato 5) e `SidecarParts` como porta única
+    - `RunCore` com os valores do `Setup` desde a S12
+- **Plano de contingência:** o core trata identidade parcial e manifesto vazio como modo degradado (FDDs 42 e 25); o marco M3 só fecha com as FDDs donas implementadas

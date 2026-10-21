@@ -1,0 +1,850 @@
+{
+  "meta": {
+    "product_or_system": "n3x-sidecar, images/runtime, images/tools/imageargs, internal/imagecheck e images/test",
+    "feature_name": "Imagens de runtime do sidecar (SID-08)",
+    "fdd_owner": "Guilherme Giusti",
+    "version": "1.0",
+    "date": "2026-10-21"
+  },
+  "context": {
+    "technical_motivation": "As FDDs 15, 25, 26 e 27 definem o que o binário n3x faz dentro do container, mas todas supõem uma imagem que ainda não existe: o Envoy em /usr/local/bin/envoy, o .so em /usr/lib/n3x/libn3x.so, o alvo em /etc/n3x/target, o UID 17000, /proc e /sys/fs/cgroup legíveis e um ENTRYPOINT que deixe docker run <imagem> encrypt funcionar. A imagem de runtime é o estágio final de todo Dockerfile de operador (FR-015); sem ela não há marco M2 em docker compose. Ficam sem resposta verificável:\n\n- De onde vem a base. O PRD e o HLD exigem envoyproxy/envoy:v1.40.x fixada por digest, e o catálogo de alvos do builder (FDD 19) já fixa esse digest. Se o sidecar declarar outro digest, a glibc e o Envoy da imagem de runtime podem divergir dos que o builder usou na verificação de símbolos e no teste de carga (FDD 23).\n- O que a imagem garante e o que fica com o orquestrador. Usuário não root, raiz somente leitura com escrita só em /tmp e drop: ALL são requisitos do HLD, mas uma imagem só controla o usuário padrão, os arquivos e as permissões. O resto depende do Kubernetes, do ECS ou do compose, e hoje nada avisa quando o container roda fora do endurecimento.\n- Versão e alvo. A FDD 25 decidiu que a versão da imagem é a constante buildinfo.Version compilada no n3x e que /etc/n3x/target guarda só o ID do alvo; falta a regra que impede publicar uma imagem cuja tag ou cuja tag core/vX.Y.Z diverge dessa constante, e falta dizer como a imagem acomoda o alvo istio-1.31 sem refazer a estrutura.\n- Saída 8. A FDD 25 reservou a saída 8 (N3X-S008) para esta FDD decidir o uso.",
+    "fit_with_hld": "Esta FDD especifica, no repositório n3x-sidecar, o bloco \"Imagens de runtime\" de \"Interfaces públicas\", a parte de imagem de \"Proteção de dados\" (endurecimento do processo e da imagem) e a \"Topologia em runtime\" do modo padrão. Pacotes e pastas:\n- images/runtime/Dockerfile: estágios comuns (n3x e files) e o estágio final por família de alvo (runtime-envoy aqui; runtime-istio na FDD 49) (contrato 6)\n- images/runtime/catalog/: cópia byte a byte dos arquivos targets/<alvo>.yaml do n3x-builder, com SOURCE.json (contrato 7)\n- images/tools/imageargs (novo, hipótese de nome): lê a cópia do catálogo, monta os argumentos do docker buildx, confere a sincronia com o builder e a versão no release (contrato 7)\n- internal/imagecheck (novo, hipótese de nome): conferência do ambiente do container no início do n3x run, dona da saída 8 (contrato 8)\n- images/test/: teste estrutural e teste de fumaça da imagem (contrato 9)\n\nQuem consome:\n- Operador: o estágio final do Dockerfile dele parte desta imagem e copia o .so (contrato 5; exemplo completo na FDD 47)\n- FDDs 25, 26 e 27: caminhos, usuário e ambiente que elas supõem (contratos 2 e 4)\n- FDD 46 (BLD-07): publica esta imagem no GHCR pelo processo comum e monta a tabela de pares\n- FDD 47 (SDK-15): guia de montagem de volumes e securityContext por orquestrador\n- FDD 48 (SDK-16): testes de ponta a ponta com a imagem real\n- FDD 49 (SID-11): estágio runtime-istio no mesmo Dockerfile\n\nRastreabilidade:\n- PRD 1.5: FR-015 (estágio final parte de ghcr.io/giustech/n3x/sidecar:<semver>-<alvo> e copia o .so; sidecar recusa core/ incompatível); FR-001 (.so ausente encerra o container; nada por variável de ambiente); compatibilidade (imagens OCI, amd64 e arm64); segurança (imagens base fixadas por digest; govulncheck e gosec); critério \"cada imagem carrega o seu .so sem erro\"\n- HLD do n3x-sidecar: \"Imagens de runtime\", \"Proteção de dados\", \"Topologia em runtime\", estrutura images/\n- ADRs: ADR-001 do n3x-sidecar (sem .so padrão); ADR-001 e ADR-009 do n3x-builder (semver por imagem, GHCR, tags imutáveis); ADR-006 do n3x-sdk (portas 17xxx); ADR-003 do n3x-sidecar (subcomandos)\n- Lacunas do README: nenhuma atribuída a esta FDD. L-16 aplicada (admin em /tmp/n3x/admin.sock, sem porta TCP exposta); L-17 continua na FDD 29 (a imagem não traz binário extra de health); L-21 aplicada (glibc e digest vêm do catálogo); L-72 aplicada (a imagem não declara as variáveis do orquestrador)\n- Pedidos atendidos:\n  - FDD 15 e FDD 27: ENTRYPOINT [\"/usr/local/bin/n3x\"] com CMD [\"run\"] (contrato 2); imagem sem ENV de GOMAXPROCS, GOMEMLIMIT e GODEBUG; /proc e /sys/fs/cgroup não são escondidos nem sobrescritos (contratos 2 e 4)\n  - FDD 19: digest da base sincronizado com o catálogo (contrato 7)\n  - FDD 23: mesma glibc da imagem do Envoy usada pelo builder (mesmo digest, por construção) e UID 17000 (contratos 2 e 7)\n  - FDD 25: /etc/n3x/target igual a <id>\\n com modo 0444; release falha se a tag da imagem ou core/vX.Y.Z diferir de buildinfo.Version; saída 8 decidida (contratos 2, 7 e 8)\n  - FDD 26: /usr/local/bin/envoy, ENV ENVOY_DYNAMIC_MODULES_SEARCH_PATH=/usr/lib/n3x, sem /tmp/n3x na imagem (contrato 2)",
+    "actors": [
+      "Operador (escreve o Dockerfile multi-stage e monta n3x.yaml, chave e CA)",
+      "Builder (gera o .so copiado para a imagem)",
+      "Orquestrador (aplica usuário, raiz somente leitura, tmpfs, capabilities e limites)",
+      "CI do n3x-sidecar (constrói, testa e, pela FDD 46, publica)",
+      "Mantenedor (atualiza a base por patch)"
+    ],
+    "assumptions": [
+      "A imagem oficial envoyproxy/envoy:v1.40.x traz o binário em /usr/local/bin/envoy (0755), getconf, /tmp com modo 1777, um docker-entrypoint.sh que troca para o usuário envoy (UID 101) quando sobe como root, e um PATH com /usr/local/bin (conferir no spike, item IMG-01)",
+      "O digest de envoy.image no catálogo é o de um índice multiplataforma com linux/amd64 e linux/arm64 (regra image_platform da FDD 19)",
+      "O BuildKit cria os pontos de montagem antes de deixar a raiz somente leitura (Docker, containerd e ECS); a imagem só garante que eles existem",
+      "O n3x é um binário Go puro (sem cgo, sem gRPC e sem o SDK Go do Envoy, critério da FDD 15), igual para todos os alvos da mesma arquitetura",
+      "O runner do GitHub Actions oferece amd64 e arm64 nativos (ubuntu-24.04 e ubuntu-24.04-arm) (hipótese; conferir custo na FDD 46)"
+    ],
+    "constraints": [
+      "Esta FDD não define o comportamento do n3x run (FDDs 15, 25, 26, 27 e 29), a publicação no GHCR, a matriz de CI das imagens de build e a tabela de pares (FDD 46), as imagens sidecar-builder (FDDs 21 e 46), os exemplos completos de montagem por orquestrador (FDD 47) nem a imagem -istio-1.31 (FDD 49, D-10 do README). Aqui ficam o conteúdo, o endurecimento verificável, a base por digest, o build multi-arquitetura, as tags, a conferência do ambiente na subida e os testes da imagem.",
+      "Base fixada por digest; amd64 e arm64; formato OCI (PRD e HLD, decisão já tomada)",
+      "Usuário e grupo 17000; raiz somente leitura com escrita só em /tmp; drop: ALL; .so só em /usr/lib/n3x/libn3x.so (HLD, decisão já tomada)",
+      "A imagem não traz .so padrão (ADR-001 do n3x-sidecar, decisão já tomada)",
+      "Tags imutáveis em ghcr.io/giustech/n3x/* (ADR-009 do n3x-builder); semver por imagem (ADR-001 do n3x-builder)",
+      "Sem QEMU: nenhum RUN no estágio final, que é o único na plataforma de destino (mesma regra da L-59 da FDD 21)",
+      "Nenhum comportamento por variável de ambiente (FR-001): a imagem não declara GOMAXPROCS, GOMEMLIMIT, GODEBUG nem N3X_* (pedido da FDD 27)",
+      "Documentação e mensagens em pt-BR; identificadores em inglês"
+    ]
+  },
+  "technical_objectives": [
+    {
+      "objective": "Base igual à do builder.",
+      "measure_or_invariant": "Invariante: para todo alvo, o FROM do estágio final usa exatamente envoy.image do arquivo targets/<alvo>.yaml do n3x-builder na referência registrada em SOURCE.json, com o mesmo digest. Medida: o job catalog-sync compara os bytes da cópia com o arquivo do builder (0 diferença) e o teste estrutural confere que as camadas da base na imagem final são as mesmas, na mesma ordem, do manifesto da base para aquela plataforma."
+    },
+    {
+      "objective": "Conteúdo exato.",
+      "measure_or_invariant": "Invariante: a imagem tem os caminhos, donos e modos da tabela do contrato 2 e nada mais além da base; /usr/lib/n3x/ está vazio; /tmp/n3x não existe. Medida: teste estrutural sobre o sistema de arquivos exportado, nas duas arquiteturas, sem executar a imagem."
+    },
+    {
+      "objective": "Duas plataformas sem emulação.",
+      "measure_or_invariant": "Medida: docker buildx build --platform linux/amd64,linux/arm64 gera um índice OCI com as duas plataformas num host amd64 sem QEMU registrado (binfmt vazio); o n3x de cada plataforma é ELF estático da arquitetura certa."
+    },
+    {
+      "objective": "Pequena por cima da base.",
+      "measure_or_invariant": "Medida: no máximo 2 camadas próprias e no máximo 20 MiB descomprimidos somados; n3x com até 15 MiB (hipótese, H-07)."
+    },
+    {
+      "objective": "Endurecida por padrão.",
+      "measure_or_invariant": "Invariante: docker run sem nenhuma opção de usuário roda como 17000:17000; com --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges, o sidecar sobe e fica pronto sem nenhum hardening_warning. Medida: teste de fumaça nativo em amd64 e arm64."
+    },
+    {
+      "objective": "Recusa explícita fora do contrato.",
+      "measure_or_invariant": "Invariante: n3x run como UID 0 sai com 8 (N3X-S008, run_as_root) antes de qualquer outro passo; sem .so sai com 4 (N3X-S004, manifest_read) sem iniciar o Envoy. Medida: teste de fumaça, as duas saídas em até 2 s."
+    },
+    {
+      "objective": "Versão coerente.",
+      "measure_or_invariant": "Invariante: a tag publicada <v>-<alvo>, o rótulo org.opencontainers.image.version, a tag core/v<v> do commit e buildinfo.Version são o mesmo texto. Medida: o gate imageargs release recusa qualquer divergência antes do build (exit 4)."
+    },
+    {
+      "objective": "Reproduzível.",
+      "measure_or_invariant": "Medida: dois builds do mesmo commit em runners diferentes, com SOURCE_DATE_EPOCH do commit e rewrite-timestamp=true, geram o mesmo digest de manifesto por plataforma (hipótese H-12; contingência: comparar os diffID das camadas próprias)."
+    }
+  ],
+  "scope": {
+    "included": [
+      "Dockerfile images/runtime/Dockerfile com a base envoyproxy/envoy:v1.40.x@sha256:... vinda do catálogo, estágios comuns e estágio final runtime-envoy, pronto para receber runtime-istio (contrato 6)",
+      "Conteúdo, donos, modos, usuário, ENTRYPOINT, CMD, ENV, portas, sinal de parada e ausência de HEALTHCHECK e VOLUME (contrato 2)",
+      "Rótulos OCI e rótulos io.n3x.* (contrato 3)",
+      "Requisitos de execução: o que a imagem garante e o que o orquestrador precisa aplicar (contrato 4)",
+      "Forma do estágio final do Dockerfile do operador (contrato 5)",
+      "Build do binário n3x (estático, CGO_ENABLED=0, cruzado sem QEMU) e build multi-arquitetura OCI com docker buildx (contrato 6)",
+      "Cópia do catálogo, ferramenta imageargs, sincronia com o builder e gate de versão do release (contrato 7)",
+      "Esquema de tags <semver>-<alvo>, imutabilidade e regra de semver da imagem (contrato 1)",
+      "Conferência do ambiente do container no n3x run e uso da saída 8 (contrato 8)",
+      "Teste estrutural, teste de fumaça (sobe com .so e n3x.yaml mínimo; falha sem .so), govulncheck e gosec do n3x (contrato 9)",
+      "Uso local no marco M2, sem publicação: n3x-dev/sidecar:dev-envoy-1.40 (contrato 6)"
+    ],
+    "excluded": [
+      "Imagem -istio-1.31 (base proxyv2, usuário 1337, substituição da imagem injetada): FDD 49 (SID-11); aqui só a estrutura que a acomoda",
+      "Publicação no GHCR, assinatura de tags, matriz de CI das imagens de build e tabela de pares: FDD 46 (BLD-07)",
+      "Imagens sidecar-builder e controller-builder: FDDs 21 e 46",
+      "Comportamento do n3x run além do passo novo de conferência do ambiente: FDDs 15, 25, 26, 27 e 29",
+      "Comando de health dentro do container (L-17): FDD 29 (SID-09)",
+      "Exemplos completos de montagem de volumes, securityContext e task definitions: FDD 47 (SDK-15)",
+      "SBOM e assinatura de imagens: fora da v1 (PRD)"
+    ]
+  },
+  "detailed_flows": {
+    "main_flow": [
+      "Build local da imagem (CI de PR e M2), passo 1: make runtime-image TARGET=envoy-1.40 chama go run ./images/tools/imageargs args --target envoy-1.40 --format buildx.",
+      "Build local da imagem (CI de PR e M2), passo 2: O imageargs lê images/runtime/catalog/envoy-1.40.yaml com yamlconv.ToJSON e decodificação tolerante (campo desconhecido é ignorado, como a FDD 19 pede aos leitores externos), confere as regras do contrato 7 e imprime os --build-arg (BASE_IMAGE, BASE_NAME, BASE_DIGEST, TARGET_ID, ENVOY_VERSION, GLIBC, VERSION igual a buildinfo.Version, REVISION, CREATED com a hora do commit em RFC 3339), o --target runtime-envoy, as plataformas de archs e a tag.",
+      "Build local da imagem (CI de PR e M2), passo 3: O BuildKit roda o estágio n3x em $BUILDPLATFORM uma vez por plataforma de destino: go build com CGO_ENABLED=0, GOOS=linux e GOARCH=$TARGETARCH (compilação cruzada pura, sem QEMU).",
+      "Build local da imagem (CI de PR e M2), passo 4: O estágio files, também em $BUILDPLATFORM, cria /etc/n3x/target com envoy-1.40\\n e os diretórios vazios /etc/n3x, /usr/lib/n3x e /run/n3x.",
+      "Build local da imagem (CI de PR e M2), passo 5: O estágio final runtime-envoy parte de BASE_IMAGE (o BuildKit escolhe a plataforma no índice do digest), faz dois COPY --link (binário e arquivos), declara ENV, rótulos, USER 17000:17000, EXPOSE, STOPSIGNAL, ENTRYPOINT e CMD. Nenhum RUN.",
+      "Build local da imagem (CI de PR e M2), passo 6: Saída: --output type=oci,dest=out/sidecar-<v>-envoy-1.40.oci.tar,rewrite-timestamp=true (as duas plataformas) ou --load de uma plataforma com a tag local n3x-dev/sidecar:dev-envoy-1.40 (make runtime-image-dev, M2).",
+      "Build local da imagem (CI de PR e M2), passo 7: make image-test roda o teste estrutural nas duas plataformas e o teste de fumaça na plataforma nativa (contrato 9).",
+      "Fluxo de uso pelo operador (FR-015), passo 1: Estágio de build: FROM --platform=$BUILDPLATFORM ghcr.io/giustech/n3x/sidecar-builder:<v>-envoy-1.40 AS build, RUN n3x-plugin add ..., ARG TARGETARCH, RUN n3x-plugin build (FDD 21).",
+      "Fluxo de uso pelo operador (FR-015), passo 2: Estágio final: FROM ghcr.io/giustech/n3x/sidecar:<v>-envoy-1.40 (recomendado com @sha256:) e COPY --from=build /out/libn3x.so /usr/lib/n3x/libn3x.so (contrato 5). O arquivo fica com dono root e o UID 17000 não consegue alterá-lo.",
+      "Fluxo de uso pelo operador (FR-015), passo 3: O orquestrador sobe o container com n3x.yaml montado como arquivo em /etc/n3x/n3x.yaml, a chave em /run/n3x/aes.key, /tmp em tmpfs e o endurecimento do contrato 4.",
+      "Fluxo da subida dentro da imagem (encaixe com a FDD 27), passo 1: O orquestrador executa /usr/local/bin/n3x run como 17000:17000 (PID 1).",
+      "Fluxo da subida dentro da imagem (encaixe com a FDD 27), passo 2: Passo 0 (novo, esta FDD): supervisor.Run chama imagecheck.Check(Options{Mode: ModeStandard}) logo depois de registrar os sinais. UID efetivo 0: environment_rejected e saída 8. Senão, loga container_environment e um hardening_warning por aviso, e segue.",
+      "Fluxo da subida dentro da imagem (encaixe com a FDD 27), passo 3: Passos 1 a 5 (FDD 25): ReadImage lê /etc/n3x/target e buildinfo.Version; o .so é lido de /usr/lib/n3x/libn3x.so; envoy --version roda /usr/local/bin/envoy.",
+      "Fluxo da subida dentro da imagem (encaixe com a FDD 27), passo 4: Passo 6 (FDD 27): lê /proc/self/cgroup, /proc/self/mountinfo e /sys/fs/cgroup/... como 17000.",
+      "Fluxo da subida dentro da imagem (encaixe com a FDD 27), passo 5: Passos 7 e 8 (FDD 26): cria /tmp/n3x (0700, dono 17000), grava o bootstrap e roda envoy --mode validate.",
+      "Fluxo da subida dentro da imagem (encaixe com a FDD 27), passo 6: Passos 9 e 10 (FDDs 27 e 29): Envoy filho carrega libn3x.so pelo search path /usr/lib/n3x; 17021, 17000 e 17090 abertas.",
+      "Fluxo de atualização da base (patch do Envoy 1.40.x), passo 1: O n3x-builder muda envoy.image em targets/envoy-1.40.yaml e o alvo volta a candidate (regra de diff da FDD 19); a matriz da FDD 46 promove a supported.",
+      "Fluxo de atualização da base (patch do Envoy 1.40.x), passo 2: Um PR no n3x-sidecar copia o arquivo novo para images/runtime/catalog/ e atualiza SOURCE.json (ref e SHA-256); catalog-sync passa.",
+      "Fluxo de atualização da base (patch do Envoy 1.40.x), passo 3: O mesmo PR sobe buildinfo.Version em um patch; o release cria core/vX.Y.Z e vX.Y.Z no mesmo commit e publica <X.Y.Z>-envoy-1.40 (FDD 46). As camadas próprias, por COPY --link, não mudam de conteúdo."
+    ],
+    "alternative_flows": [
+      "Catálogo copiado diverge do builder: imageargs sync sai com 3 (catalog_drift, com os dois SHA-256); o job falha no PR. Na execução noturna contra a branch principal do builder, a divergência abre uma issue com o rótulo catalog, sem bloquear a branch principal (hipótese)",
+      "Alvo candidate ou deprecated: imageargs args emite o aviso target_status e constrói; a política de publicação dessas imagens é da FDD 46",
+      "Alvo istio-* antes da FDD 49: imageargs args sai com 2 (target_unsupported: \"o estágio runtime-istio ainda não existe; ver FDD 49\")",
+      "Release com versão divergente: imageargs release --tag v1.1.3 com buildinfo.Version = \"1.1.2\" sai com 4 (version_mismatch); sem a tag core/v1.1.3 no mesmo commit, core_tag_missing; árvore com alteração, dirty_tree. Nada é construído nem publicado",
+      "Operador esqueceu o COPY do .so: n3x run sai com 4 (N3X-S004, manifest_read, texto da FDD 25: \"nenhum libn3x.so em /usr/lib/n3x/libn3x.so: a imagem de runtime não traz .so; copie o /out/libn3x.so do n3x-plugin build no estágio final\"); o Envoy não sobe",
+      ".so de outro alvo ou de core/ mais novo: saída 5 do pré-voo (target_mismatch, runtime_too_new), com a imagem a usar (FDD 25)",
+      "Container como root (docker run --user 0, runAsUser: 0): saída 8, run_as_root; os subcomandos validate, encrypt e keygen não fazem essa conferência",
+      "UID diferente de 17000 e de 0 (OpenShift com UID aleatório e GID 0): aceito sem aviso; todos os arquivos da imagem são legíveis por qualquer usuário; uid aparece no container_environment",
+      "Raiz gravável, capabilities presentes, /tmp fora de tmpfs ou .so gravável pelo processo: um hardening_warning por item, e sobe",
+      "Raiz somente leitura sem tmpfs em /tmp: saída 6, reason write (FDD 26)",
+      "Diretório montado sobre /etc/n3x (ConfigMap montado como diretório): esconde /etc/n3x/target; saída 5, image_target, com a dica de montar o n3x.yaml como arquivo (subPath) (pedido à FDD 25; inconsistência I-03)",
+      "Chave ou n3x.yaml sem permissão de leitura para 17000: saída 3 (key_read) ou 2 (file_read) da FDD 15, com UID e GID do processo no texto (pedido à FDD 15)",
+      "docker run <imagem> keygen ou encrypt: o CMD é trocado pelos argumentos e o ENTRYPOINT continua o n3x (ADR-003)",
+      "docker run --entrypoint envoy <imagem> --version: funciona como 17000, útil para diagnóstico; não passa pelo n3x"
+    ],
+    "diagrams": [
+      "mermaid\n%% Estágios do Dockerfile e plataformas:\nflowchart LR\n    CAT[images/runtime/catalog/envoy-1.40.yaml] --> ARGS[imageargs args]\n    BI[core/buildinfo.Version] --> ARGS\n    ARGS --> BX[docker buildx build --platform amd64,arm64]\n    subgraph BUILDPLATFORM [estágios no host, sem QEMU]\n      N[n3x: go build CGO_ENABLED=0 GOARCH=TARGETARCH]\n      F[files: /etc/n3x/target, diretórios vazios]\n    end\n    subgraph DESTINO [estágio final por plataforma, sem RUN]\n      B[FROM envoy.image @sha256 do catálogo] --> C1[COPY --link n3x]\n      C1 --> C2[COPY --link files]\n      C2 --> M[ENV, LABEL, USER 17000:17000, ENTRYPOINT, CMD]\n    end\n    BX --> N\n    BX --> F\n    N --> C1\n    F --> C2\n    M --> OCI[índice OCI linux/amd64 e linux/arm64]",
+      "mermaid\n%% Camadas da imagem do operador:\nflowchart TB\n    L0[camadas da base envoyproxy/envoy:v1.40.x, iguais às do digest] --> L1[camada 1: /usr/local/bin/n3x]\n    L1 --> L2[camada 2: /etc/n3x/target, /etc/n3x, /usr/lib/n3x, /run/n3x]\n    L2 --> L3[camada do operador: /usr/lib/n3x/libn3x.so]",
+      "mermaid\n%% Subida com o passo 0:\nsequenceDiagram\n    participant O as orquestrador\n    participant S as n3x run (PID 1, UID 17000)\n    participant IC as imagecheck\n    participant P as preflight (FDD 25)\n    O->>S: inicia o container\n    S->>S: sinais (FDD 27)\n    S->>IC: Check(ModeStandard)\n    alt UID efetivo 0\n        IC-->>S: ErrRunAsRoot\n        S-->>O: saída 8 (N3X-S008 run_as_root)\n    else outro UID\n        IC-->>S: Report e avisos\n        S->>S: container_environment e hardening_warning\n        S->>P: Run (lê /etc/n3x/target e /usr/lib/n3x/libn3x.so)\n    end"
+    ]
+  },
+  "public_contracts": [
+    {
+      "name": "Contrato 1: nome, tags, plataformas e imutabilidade",
+      "kind": "sdk",
+      "signature_or_route": "ghcr.io/giustech/n3x/sidecar:<versão>-<alvo>",
+      "request_example": "text\ndocker buildx imagetools inspect ghcr.io/giustech/n3x/sidecar:1.1.2-envoy-1.40",
+      "response_example": {
+        "digests ilustrativos": "text\nName:      ghcr.io/giustech/n3x/sidecar:1.1.2-envoy-1.40\nMediaType: application/vnd.oci.image.index.v1+json\nDigest:    sha256:7e0c5a91d2b4...\n\nManifests:\n  Name:      ghcr.io/giustech/n3x/sidecar:1.1.2-envoy-1.40@sha256:3a91f0c4b8e2...\n  MediaType: application/vnd.oci.image.manifest.v1+json\n  Platform:  linux/amd64\n\n  Name:      ghcr.io/giustech/n3x/sidecar:1.1.2-envoy-1.40@sha256:c41d7f20a9b3...\n  MediaType: application/vnd.oci.image.manifest.v1+json\n  Platform:  linux/arm64"
+      },
+      "headers_semantics": [
+        "Tipo declarado: imagem OCI (índice multiplataforma)",
+        "Método: n/a (docker pull, FROM)",
+        "<versão>: exatamente buildinfo.Version (semver 2.0.0 sem v; pré-release permitido, por exemplo 1.2.0-rc.1; sem metadado +, que a tag OCI não aceita). É também a versão do core/ compilado no n3x (FDD 25, contrato 10)",
+        "<alvo>: o id do catálogo (envoy-1.40; istio-1.31 pela FDD 49). O alvo é sempre o sufixo que casa com -(envoy|istio)-[0-9]+\\.[0-9]+$, o que separa o alvo de uma pré-release sem ambiguidade",
+        "Plataformas: as de archs do catálogo (para envoy-1.40, linux/amd64 e linux/arm64), num índice OCI (application/vnd.oci.image.index.v1+json)",
+        "Imutabilidade (ADR-009): uma tag publicada nunca é sobrescrita nem apagada. Não há tags móveis (latest, 1.1-envoy-1.40) (hipótese H-03); o operador fixa por tag e, de preferência, por digest",
+        "Compatibilidade com o .so (ADR-001 do builder, FDD 22): a imagem aceita .so com core/ da mesma major e minor igual ou menor; na série 0, minor igual",
+        "Imagem local de desenvolvimento: n3x-dev/sidecar:dev-<alvo>, nunca publicada (sem o prefixo ghcr.io/giustech), igual ao padrão n3x-dev/... da FDD 21"
+      ],
+      "versioning": "Semver da imagem (hipótese H-04, coerente com ADR-001 do builder e com o acoplamento da FDD 25): patch para troca de digest da base (patch do Envoy 1.40.x), correção do n3x ou do core/; minor para recurso novo do n3x, campo novo no n3x.yaml ou arquivo novo na imagem; major para mudança de caminho, UID, ENTRYPOINT, CMD, formato de /etc/n3x/target ou significado de um código de saída. Como a versão é a do core/, um patch só de base também cria a tag core/vX.Y.Z (inconsistência I-05)"
+    },
+    {
+      "name": "Contrato 2: layout de arquivos, permissões e configuração da imagem",
+      "kind": "sdk",
+      "signature_or_route": "estágio runtime-envoy de images/runtime/Dockerfile",
+      "request_example": "text\ndocker image inspect --format '{{json .Config}}' n3x-dev/sidecar:dev-envoy-1.40\ndocker run --rm --entrypoint /bin/ls n3x-dev/sidecar:dev-envoy-1.40 -ln /etc/n3x /usr/lib/n3x /run/n3x /usr/local/bin",
+      "response_example": {
+        "config da imagem, encurtado": {
+          "User": "17000:17000",
+          "Env": [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "ENVOY_DYNAMIC_MODULES_SEARCH_PATH=/usr/lib/n3x"
+          ],
+          "Entrypoint": [
+            "/usr/local/bin/n3x"
+          ],
+          "Cmd": [
+            "run"
+          ],
+          "WorkingDir": "/",
+          "ExposedPorts": {
+            "17000/tcp": {},
+            "17021/tcp": {},
+            "17090/tcp": {}
+          },
+          "StopSignal": "SIGTERM"
+        },
+        "listagem de ls -ln, encurtado": "text\n/etc/n3x:\n-r--r--r-- 1 0 0       11 Jan  1  1970 target\n/usr/lib/n3x:\n/run/n3x:\n/usr/local/bin:\n-rwxr-xr-x 1 0 0 67108864 ...  envoy\n-r-xr-xr-x 1 0 0  9437184 Jan  1  1970 n3x"
+      },
+      "headers_semantics": [
+        "Tipo declarado: formato da imagem (sistema de arquivos e config OCI)",
+        "Layout de arquivos, caminho /usr/local/bin/n3x: dono 0:0, modo 0555, origem estágio n3x; ELF estático da plataforma, sem PT_INTERP nem DT_NEEDED",
+        "Layout de arquivos, caminho /usr/local/bin/envoy: dono da base, modo da base (0755), origem base; usado por n3x run, --mode validate e envoy --version (FDDs 25, 26 e 27)",
+        "Layout de arquivos, caminho /etc/n3x/: dono 0:0, modo 0755, origem estágio files; ponto de montagem do n3x.yaml e da CA, montados como arquivos",
+        "Layout de arquivos, caminho /etc/n3x/target: dono 0:0, modo 0444, origem estágio files; <id>\\n (por exemplo envoy-1.40\\n, 11 bytes); formato da FDD 25, contrato 10",
+        "Layout de arquivos, caminho /usr/lib/n3x/: dono 0:0, modo 0755, origem estágio files; vazio; destino do COPY do operador; search path do Envoy",
+        "Layout de arquivos, caminho /usr/lib/n3x/libn3x.so: dono ausente, origem operador; a imagem nunca traz .so (ADR-001)",
+        "Layout de arquivos, caminho /run/n3x/: dono 0:0, modo 0755, origem estágio files; vazio; ponto de montagem recomendado da chave AES (/run/n3x/aes.key, exemplos da FDD 15)",
+        "Layout de arquivos, caminho /tmp: dono da base, modo 1777, origem base; o orquestrador monta tmpfs; /tmp/n3x é criado pelo n3x run (FDD 26), nunca pela imagem",
+        "Nenhum outro caminho muda em relação à base (o teste estrutural compara a lista de arquivos da camada própria com a lista esperada)",
+        "Configuração OCI, campo User, valor 17000:17000: numérico, para runAsNonRoot do Kubernetes funcionar sem /etc/passwd; não há entrada n3x no /etc/passwd (hipótese H-06)",
+        "Configuração OCI, campo Entrypoint, valor [\"/usr/local/bin/n3x\"]: pedido das FDDs 15 e 27 (n3x sem run), com caminho absoluto para não depender do PATH que o orquestrador pode sobrescrever (inconsistência I-01)",
+        "Configuração OCI, campo Cmd, valor [\"run\"]: docker run <imagem> encrypt ... troca só o CMD",
+        "Configuração OCI, campo Env, valor o da base mais ENVOY_DYNAMIC_MODULES_SEARCH_PATH=/usr/lib/n3x: pedido das FDDs 16 e 26; o n3x run monta o ambiente do Envoy do zero (FDD 27), então a variável serve a docker run --entrypoint envoy e ao modo Istio",
+        "Configuração OCI, campo Env proibido, valor GOMAXPROCS, GOMEMLIMIT, GODEBUG, GOGC, qualquer N3X_*, KUBERNETES_SERVICE_HOST, ECS_CONTAINER_METADATA_URI_V4: FR-001, FDD 27 e L-72",
+        "Configuração OCI, campo WorkingDir, valor /",
+        "Configuração OCI, campo ExposedPorts, valor 17000/tcp, 17021/tcp, 17090/tcp: ADR-006 do SDK; a 17001 não é exposta (L-16)",
+        "Configuração OCI, campo StopSignal, valor SIGTERM: drenagem (FDD 29)",
+        "Configuração OCI, campo Healthcheck, valor ausente: o compose e o ECS declaram o comando da FDD 29 (L-17); igual à imagem do controller (FDD 30)",
+        "Configuração OCI, campo Volumes, valor ausente: VOLUME /tmp criaria volume anônimo em disco e esconderia a falta do tmpfs (hipótese H-08)",
+        "Configuração OCI, campo OnBuild, valor ausente: o operador não deve ter efeito oculto no FROM",
+        "Configuração OCI, campo Labels, valor contrato 3"
+      ],
+      "limits": {
+        "payload_size": "no máximo 2 camadas próprias, somando no máximo 20 MiB descomprimidos; n3x com até 15 MiB (hipótese H-07)"
+      }
+    },
+    {
+      "name": "Contrato 3: rótulos OCI e io.n3x.*",
+      "kind": "sdk",
+      "signature_or_route": "LABEL do estágio final",
+      "request_example": "text\ndocker image inspect --format '{{json .Config.Labels}}' ghcr.io/giustech/n3x/sidecar:1.1.2-envoy-1.40",
+      "response_example": {
+        "org.opencontainers.image.title": "n3x sidecar (envoy-1.40)",
+        "org.opencontainers.image.description": "Envoy com o entrypoint n3x; copie o libn3x.so gerado pelo n3x-plugin build para /usr/lib/n3x/libn3x.so",
+        "org.opencontainers.image.source": "https://github.com/giustech/n3x-sidecar",
+        "org.opencontainers.image.version": "1.1.2",
+        "org.opencontainers.image.revision": "4f2c9d0e1a7b3c5d6e8f90a1b2c3d4e5f6a7b8c9",
+        "org.opencontainers.image.created": "2026-10-20T13:41:07Z",
+        "org.opencontainers.image.licenses": "Apache-2.0",
+        "org.opencontainers.image.base.name": "docker.io/envoyproxy/envoy:v1.40.2",
+        "org.opencontainers.image.base.digest": "sha256:3b1d6f0a...",
+        "io.n3x.image.kind": "sidecar",
+        "io.n3x.target": "envoy-1.40",
+        "io.n3x.core.module": "github.com/giustech/n3x-sidecar/core",
+        "io.n3x.core.version": "1.1.2",
+        "io.n3x.envoy.version": "1.40.2",
+        "io.n3x.glibc": "2.35"
+      },
+      "headers_semantics": [
+        "Tipo declarado: metadado da imagem (config.Labels), legível com docker inspect e docker buildx imagetools inspect --format '{{json .Image}}'",
+        "Rótulo org.opencontainers.image.title, valor n3x sidecar (<alvo>), fonte fixo",
+        "Rótulo org.opencontainers.image.description, valor Envoy com o entrypoint n3x; copie o libn3x.so gerado pelo n3x-plugin build para /usr/lib/n3x/libn3x.so, fonte fixo",
+        "Rótulo org.opencontainers.image.source, valor https://github.com/giustech/n3x-sidecar, fonte fixo",
+        "Rótulo org.opencontainers.image.version, valor <versão> (igual a buildinfo.Version), fonte imageargs",
+        "Rótulo org.opencontainers.image.revision, valor commit de 40 hex, fonte git rev-parse HEAD",
+        "Rótulo org.opencontainers.image.created, valor RFC 3339 de SOURCE_DATE_EPOCH (hora do commit), fonte reprodutível",
+        "Rótulo org.opencontainers.image.licenses, valor Apache-2.0, fonte fixo",
+        "Rótulo org.opencontainers.image.base.name, valor docker.io/envoyproxy/envoy:v1.40.<patch>, fonte catálogo",
+        "Rótulo org.opencontainers.image.base.digest, valor sha256:<64 hex> do índice da base, fonte catálogo",
+        "Rótulo io.n3x.image.kind, valor sidecar, fonte fixo",
+        "Rótulo io.n3x.target, valor <alvo>, fonte catálogo; igual a /etc/n3x/target sem a quebra de linha",
+        "Rótulo io.n3x.core.module, valor github.com/giustech/n3x-sidecar/core, fonte buildinfo.Module",
+        "Rótulo io.n3x.core.version, valor <versão>, fonte buildinfo.Version",
+        "Rótulo io.n3x.envoy.version, valor 1.40.<patch>, fonte tag de envoy.image",
+        "Rótulo io.n3x.glibc, valor envoy.glibc do catálogo (por exemplo 2.35), fonte catálogo",
+        "Os rótulos são só para inspeção: o n3x run nunca os lê (o processo não tem acesso a eles). A versão vem de buildinfo.Version e o alvo de /etc/n3x/target (FDD 25)",
+        "Rótulos herdados da base com a mesma chave são sobrescritos; os demais rótulos herdados ficam e entram no golden do teste estrutural"
+      ],
+      "versioning": "Rótulo novo só por adição; nenhum muda de sentido na major"
+    },
+    {
+      "name": "Contrato 4: requisitos de execução (o que a imagem garante e o que o orquestrador aplica)",
+      "kind": "sdk",
+      "signature_or_route": "n/a",
+      "request_example": {
+        "forma mínima no compose; o guia completo é da FDD 47": "yaml\nservices:\n  sidecar:\n    image: registry.acme/pedidos-sidecar:1.4.0\n    read_only: true\n    tmpfs: [\"/tmp:size=64m,mode=1777\"]\n    cap_drop: [ALL]\n    security_opt: [\"no-new-privileges:true\"]\n    mem_limit: 256m\n    cpus: 1\n    volumes:\n      - ./n3x.yaml:/etc/n3x/n3x.yaml:ro\n      - ./aes.key:/run/n3x/aes.key:ro"
+      },
+      "response_example": {
+        "container_environment de um container endurecido": {
+          "ts": "2026-10-21T14:00:00.002Z",
+          "level": "info",
+          "component": "entrypoint",
+          "msg": "container_environment",
+          "uid": 17000,
+          "gid": 17000,
+          "groups": [
+            17000
+          ],
+          "rootfs_readonly": true,
+          "tmp_tmpfs": true,
+          "cap_eff": "0000000000000000",
+          "cap_bnd": "0000000000000000",
+          "no_new_privs": true,
+          "so_writable": false,
+          "image_version": "1.1.2",
+          "duration_ms": 1
+        }
+      },
+      "headers_semantics": [
+        "Tipo declarado: contrato de implantação (documentado em images/README.md; exemplos completos na FDD 47)",
+        "Requisito: Usuário não root, 17000:17000 por padrão; quem garante: imagem (USER); como é verificado: teste estrutural; container_environment.uid",
+        "Requisito: Arquivos da imagem legíveis por qualquer UID; quem garante: imagem (modos do contrato 2); como é verificado: teste estrutural",
+        "Requisito: /usr/lib/n3x/libn3x.so com dono root e não gravável pelo processo; quem garante: COPY do operador (padrão do Docker: dono 0:0); como é verificado: imagecheck (access(W_OK))",
+        "Requisito: Raiz somente leitura; quem garante: orquestrador (readOnlyRootFilesystem, read_only, readonlyRootFilesystem); como é verificado: imagecheck (statfs(\"/\") com ST_RDONLY)",
+        "Requisito: /tmp gravável, em tmpfs, não compartilhado com a aplicação; quem garante: orquestrador (emptyDir com medium: Memory, tmpfs: /tmp); como é verificado: imagecheck (/proc/self/mountinfo); escrita da FDD 26",
+        "Requisito: Nenhuma capability (drop: ALL); quem garante: orquestrador; como é verificado: imagecheck (CapEff e CapBnd em /proc/self/status)",
+        "Requisito: Sem escalada de privilégio; quem garante: orquestrador (allowPrivilegeEscalation: false, no-new-privileges); como é verificado: container_environment.no_new_privs",
+        "Requisito: /proc e /sys/fs/cgroup montados e legíveis por 17000; quem garante: runtime de container (padrão); a imagem não declara VOLUME nem arquivo nesses caminhos; como é verificado: teste de fumaça (runtime_computed.memory_source)",
+        "Requisito: Limite de memória do container; quem garante: orquestrador; como é verificado: FDD 27",
+        "Requisito: n3x.yaml montado como arquivo em /etc/n3x/n3x.yaml, sem esconder /etc/n3x/target; quem garante: orquestrador (subPath no Kubernetes; bind de arquivo no compose e no ECS); como é verificado: FDD 25",
+        "Requisito: Chave AES e CA legíveis por 17000; quem garante: orquestrador (fsGroup: 17000 com defaultMode: 0440; dono ou grupo 17000 no compose); como é verificado: FDD 15",
+        "Requisito: Seccomp padrão; quem garante: orquestrador (RuntimeDefault); como é verificado: não verificado (hipótese H-10: o Envoy e o Go não precisam de syscall fora do perfil padrão; spike IMG-03)",
+        "A imagem não traz curl, shell extra nem binário de health: o comando de health é o do n3x (FDD 29, L-17)"
+      ],
+      "status_semantics": [
+        "Requisito: Usuário não root, 17000:17000 por padrão; se faltar: UID 0: saída 8 run_as_root",
+        "Requisito: /usr/lib/n3x/libn3x.so com dono root e não gravável pelo processo; se faltar: aviso so_writable",
+        "Requisito: Raiz somente leitura; se faltar: aviso rootfs_writable",
+        "Requisito: /tmp gravável, em tmpfs, não compartilhado com a aplicação; se faltar: sem escrita: saída 6 write; fora de tmpfs: aviso tmp_not_tmpfs",
+        "Requisito: Nenhuma capability (drop: ALL); se faltar: aviso capabilities_present",
+        "Requisito: Sem escalada de privilégio; se faltar: só registrado",
+        "Requisito: /proc e /sys/fs/cgroup montados e legíveis por 17000; se faltar: cgroup_unreadable e, sem resources.memory, saída 7 (FDD 27)",
+        "Requisito: Limite de memória do container; se faltar: saída 7 memory_unlimited",
+        "Requisito: n3x.yaml montado como arquivo em /etc/n3x/n3x.yaml, sem esconder /etc/n3x/target; se faltar: saída 5 image_target",
+        "Requisito: Chave AES e CA legíveis por 17000; se faltar: saída 3 key_read ou 2 file_read"
+      ]
+    },
+    {
+      "name": "Contrato 5: estágio final do Dockerfile do operador (só a forma)",
+      "kind": "sdk",
+      "signature_or_route": "FROM ghcr.io/giustech/n3x/sidecar:<versão>-<alvo>[@sha256:<digest>]   (sem --platform; sem RUN)\nCOPY --from=build /out/libn3x.so /usr/lib/n3x/libn3x.so",
+      "request_example": "dockerfile\nFROM ghcr.io/giustech/n3x/sidecar:1.1.2-envoy-1.40@sha256:7e0c5a91d2b4...\nCOPY --from=build /out/libn3x.so /usr/lib/n3x/libn3x.so",
+      "response_example": {
+        "camadas da imagem do operador, docker history, encurtado": "text\nCREATED BY                                              SIZE\nCOPY /out/libn3x.so /usr/lib/n3x/libn3x.so # buildkit   41.9MB\nCMD [\"run\"]                                             0B\nENTRYPOINT [\"/usr/local/bin/n3x\"]                       0B\nUSER 17000:17000                                        0B\nCOPY /stage/ / # buildkit                               4.1kB\nCOPY /stage/usr/local/bin/n3x /usr/local/bin/n3x        9.4MB\n(camadas da base envoyproxy/envoy:v1.40.2)"
+      },
+      "headers_semantics": [
+        "Tipo declarado: Docker BuildKit (Dockerfile multi-stage)",
+        "É exatamente o estágio final do contrato 8 da FDD 21; esta FDD só fixa o destino e as regras",
+        "Sem --chown: o .so fica com dono 0:0 e não é gravável por 17000 (com --chown=17000, aviso so_writable)",
+        "Sem USER, ENTRYPOINT, CMD ou ENV novos: mudar qualquer um sai do contrato desta imagem",
+        "Sem RUN no estágio final, para o build multi-arquitetura não precisar de QEMU",
+        "Outros arquivos (por exemplo um n3x.yaml embutido) podem ser copiados para /etc/n3x/n3x.yaml, mas a recomendação é montar (config por serviço, FDD 47)"
+      ],
+      "status_semantics": [
+        "O <alvo> e a versão de core/ precisam combinar com a sidecar-builder do estágio de build (mesmo alvo; minor do core/ da imagem maior ou igual); senão, saída 5 do pré-voo com a imagem indicada (FDD 25)"
+      ]
+    },
+    {
+      "name": "Contrato 6: images/runtime/Dockerfile e alvos do Makefile",
+      "kind": "sdk",
+      "signature_or_route": "make runtime-image     TARGET=envoy-1.40 [PLATFORMS=linux/amd64,linux/arm64]   # índice OCI em out/\nmake runtime-image-dev TARGET=envoy-1.40                                         # --load amd64, n3x-dev/sidecar:dev-envoy-1.40\nmake image-test        TARGET=envoy-1.40                                         # contrato 9",
+      "request_example": {
+        "images/runtime/Dockerfile; digests entre <> ficam no repositório": "dockerfile\n# syntax=docker/dockerfile:1.10\n# Imagem de runtime do sidecar (FDD 28). Os argumentos vêm de images/tools/imageargs.\nARG GO_IMAGE=golang:1.26.1-trixie@sha256:<digest>\nARG BASE_IMAGE\nARG TARGET_ID\n\nFROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS n3x\nARG TARGETARCH\nWORKDIR /src\nCOPY go.mod go.sum ./\nCOPY core/go.mod core/go.sum ./core/\nRUN --mount=type=cache,target=/go/pkg/mod go mod download\nCOPY . .\nRUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \\\n    CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH GOAMD64=v1 GOARM64=v8.0 GOFLAGS=-mod=readonly \\\n    go build -trimpath -buildvcs=false -ldflags=\"-s -w -buildid=\" \\\n      -o /stage/usr/local/bin/n3x ./cmd/n3x\n\nFROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS files\nARG TARGET_ID\nRUN set -eu; mkdir -p /stage/etc/n3x /stage/usr/lib/n3x /stage/run/n3x; \\\n    printf '%s\\n' \"$TARGET_ID\" > /stage/etc/n3x/target; \\\n    chmod 0755 /stage/etc/n3x /stage/usr/lib/n3x /stage/run/n3x; chmod 0444 /stage/etc/n3x/target\n\nFROM ${BASE_IMAGE} AS runtime-envoy\nARG VERSION REVISION TARGET_ID BASE_NAME BASE_DIGEST ENVOY_VERSION GLIBC CREATED\nCOPY --link --from=n3x --chown=0:0 --chmod=0555 /stage/usr/local/bin/n3x /usr/local/bin/n3x\nCOPY --link --from=files --chown=0:0 /stage/ /\nENV ENVOY_DYNAMIC_MODULES_SEARCH_PATH=/usr/lib/n3x\nLABEL org.opencontainers.image.title=\"n3x sidecar (${TARGET_ID})\" \\\n      org.opencontainers.image.description=\"Envoy com o entrypoint n3x; copie o libn3x.so gerado pelo n3x-plugin build para /usr/lib/n3x/libn3x.so\" \\\n      org.opencontainers.image.source=\"https://github.com/giustech/n3x-sidecar\" \\\n      org.opencontainers.image.version=\"${VERSION}\" \\\n      org.opencontainers.image.revision=\"${REVISION}\" \\\n      org.opencontainers.image.created=\"${CREATED}\" \\\n      org.opencontainers.image.licenses=\"Apache-2.0\" \\\n      org.opencontainers.image.base.name=\"${BASE_NAME}\" \\\n      org.opencontainers.image.base.digest=\"${BASE_DIGEST}\" \\\n      io.n3x.image.kind=\"sidecar\" io.n3x.target=\"${TARGET_ID}\" \\\n      io.n3x.core.module=\"github.com/giustech/n3x-sidecar/core\" io.n3x.core.version=\"${VERSION}\" \\\n      io.n3x.envoy.version=\"${ENVOY_VERSION}\" io.n3x.glibc=\"${GLIBC}\"\nUSER 17000:17000\nWORKDIR /\nEXPOSE 17000 17021 17090\nSTOPSIGNAL SIGTERM\nENTRYPOINT [\"/usr/local/bin/n3x\"]\nCMD [\"run\"]\n\n# FDD 49: estágio runtime-istio (FROM ${BASE_IMAGE} com istio/proxyv2, USER 1337:1337)",
+        "comando de build": "text\ndocker buildx build -f images/runtime/Dockerfile \\\n  $(go run ./images/tools/imageargs args --target envoy-1.40 --format buildx) \\\n  --build-arg SOURCE_DATE_EPOCH=\"$(git log -1 --format=%ct)\" \\\n  --output type=oci,dest=out/sidecar-1.1.2-envoy-1.40.oci.tar,rewrite-timestamp=true ."
+      },
+      "response_example": {
+        "log do BuildKit num host amd64 sem QEMU, encurtado": "text\n#9  [linux/amd64->amd64 n3x 6/6] RUN ... go build ... ./cmd/n3x        DONE 18.2s\n#10 [linux/amd64->arm64 n3x 6/6] RUN ... go build ... ./cmd/n3x        DONE 19.0s\n#12 [linux/arm64 runtime-envoy 1/3] FROM docker.io/envoyproxy/envoy:v1.40.2@sha256:3b1d...\n#14 [linux/arm64 runtime-envoy 3/3] COPY --link --from=files /stage/ /  DONE 0.0s\n#16 exporting to oci image format                                       DONE 2.9s"
+      },
+      "headers_semantics": [
+        "Tipo declarado: Dockerfile do repositório e comandos de build",
+        "ARGs globais: GO_IMAGE (golang:1.26.x fixada por digest), BASE_IMAGE, BASE_NAME, BASE_DIGEST, TARGET_ID, ENVOY_VERSION, GLIBC, VERSION, REVISION, CREATED, SOURCE_DATE_EPOCH. Todos, menos GO_IMAGE e SOURCE_DATE_EPOCH (passado pelo Makefile com git log -1 --format=%ct), vêm do imageargs; GO_IMAGE fica no próprio Dockerfile e é atualizado por PR",
+        "Estágio n3x (FROM --platform=$BUILDPLATFORM): CGO_ENABLED=0, GOOS=linux, GOARCH=$TARGETARCH, GOAMD64=v1, GOARM64=v8.0 (mesmos níveis da FDD 21), GOFLAGS=-mod=readonly, go build -trimpath -buildvcs=false -ldflags=\"-s -w -buildid=\" -o /stage/usr/local/bin/n3x ./cmd/n3x. O binário é igual para todos os alvos da mesma arquitetura e o BuildKit reaproveita o estágio entre alvos. -s -w tira a tabela de símbolos e o DWARF; o rastro de pilha do Go continua legível (hipótese H-05)",
+        "Estágio files (FROM --platform=$BUILDPLATFORM): cria /stage/etc/n3x/target com printf '%s\\n' \"$TARGET_ID\" e modo 0444, e os diretórios /stage/etc/n3x, /stage/usr/lib/n3x e /stage/run/n3x com modo 0755",
+        "Estágio final runtime-envoy (FROM ${BASE_IMAGE}): COPY --link --chown=0:0 --chmod=0555 do binário, COPY --link --chown=0:0 de /stage/ para /, ENV, LABEL, USER, WORKDIR, EXPOSE, STOPSIGNAL, ENTRYPOINT e CMD. --link deixa as camadas próprias independentes da base, então uma troca de patch do Envoy não muda o conteúdo delas",
+        "Estrutura para outros alvos: cada família tem um estágio final (runtime-envoy; runtime-istio pela FDD 49, com USER 1337:1337); os estágios n3x e files são comuns; o imageargs escolhe o estágio pelo prefixo do id. Um alvo novo da mesma família (por exemplo envoy-1.41) só precisa do arquivo de catálogo",
+        ".dockerignore: exclui .git, out/, bench/, docs/ e deploy/, para o contexto e o cache do estágio n3x dependerem só do código",
+        "M2 sem publicação: make runtime-image-dev usa o driver docker do buildx e --load; o Dockerfile do operador do M2 usa FROM n3x-dev/sidecar:dev-envoy-1.40 com o .so da n3x-dev/sidecar-builder:dev-envoy-1.40 (FDD 21). Para a regra da série 0, a SIDECAR_RUNTIME da imagem de build de desenvolvimento precisa ter a mesma minor de buildinfo.Version (hipótese H-14; o teste de fumaça usa a pseudo-versão do próprio commit)"
+      ]
+    },
+    {
+      "name": "Contrato 7: cópia do catálogo e ferramenta imageargs",
+      "kind": "sdk",
+      "signature_or_route": "images/runtime/catalog/<alvo>.yaml    cópia byte a byte de n3x-builder/targets/<alvo>.yaml\nimages/runtime/catalog/SOURCE.json    {\"format\":1,\"repository\":\"github.com/giustech/n3x-builder\",\"ref\":\"<tag ou 40 hex>\",\"files\":{\"<alvo>.yaml\":\"sha256:<64 hex>\"}}\n\ngo run ./images/tools/imageargs args    --target <alvo> [--format buildx|json] [--revision <40 hex>]\ngo run ./images/tools/imageargs sync    --target <alvo> --from <arquivo do builder na ref>\ngo run ./images/tools/imageargs release --tag v<X.Y.Z> --target <alvo>",
+      "request_example": "text\ngo run ./images/tools/imageargs args --target envoy-1.40 --format json\ngo run ./images/tools/imageargs release --tag v1.1.3 --target envoy-1.40",
+      "response_example": {
+        "args --format json": {
+          "target": "envoy-1.40",
+          "stage": "runtime-envoy",
+          "status": "supported",
+          "base_image": "envoyproxy/envoy:v1.40.2@sha256:3b1d6f0a...",
+          "base_name": "docker.io/envoyproxy/envoy:v1.40.2",
+          "base_digest": "sha256:3b1d6f0a...",
+          "envoy_version": "1.40.2",
+          "glibc": "2.35",
+          "platforms": [
+            "linux/amd64",
+            "linux/arm64"
+          ],
+          "version": "1.1.2",
+          "revision": "4f2c9d0e1a7b3c5d6e8f90a1b2c3d4e5f6a7b8c9",
+          "tag": "ghcr.io/giustech/n3x/sidecar:1.1.2-envoy-1.40",
+          "warnings": []
+        },
+        "release com versão divergente": "text\n(release) --tag: v1.1.3 difere de buildinfo.Version 1.1.2; suba a constante em core/buildinfo e crie core/v1.1.3 no mesmo commit [version_mismatch]\nexit 4"
+      },
+      "headers_semantics": [
+        "Tipo declarado: arquivos do repositório e CLI interna (images/tools/imageargs, módulo raiz do n3x-sidecar, importa core/buildinfo e yamlconv do SDK)",
+        "Método: processo; saída em stdout (argumentos ou JSON), problemas em stderr no formato de lista da FDD 15 (<caminho>: <texto> [<regra>])",
+        "Fonte de verdade do digest: o catálogo do n3x-builder (FDD 19). O sidecar não pode importar internal/catalog do builder, então guarda uma cópia exata e confere a sincronia. Leitura tolerante: só format, id, status, envoy.image, envoy.glibc, runtime_image e archs; campo desconhecido é ignorado; format diferente de 1 é erro (contrato de leitor externo da FDD 19)",
+        "args: confere as regras abaixo e imprime os argumentos do build. VERSION sai sempre de buildinfo.Version (nunca de flag), para a imagem não ter outra versão que não a do binário. REVISION vem de --revision ou de git rev-parse HEAD (com -dirty se a árvore tiver alteração, só fora do release). Avisos (target_status) vão para stderr e não mudam a saída",
+        "sync: compara o SHA-256 da cópia com o do arquivo indicado e com o de SOURCE.json; o job de CI baixa o arquivo do builder na ref de SOURCE.json",
+        "release: roda sync contra o builder na ref, depois as regras de release; só com saída 0 o fluxo de publicação da FDD 46 continua"
+      ],
+      "status_semantics": [
+        "Regras e saídas, saída 1, regra (uso): flag ausente ou desconhecida (subcomando: todos)",
+        "Regras e saídas, saída 2, regra catalog_read: arquivo ausente, acima de 64 KiB ou YAML inválido (subcomando: todos)",
+        "Regras e saídas, saída 2, regra format: format diferente de 1 (subcomando: todos)",
+        "Regras e saídas, saída 2, regra id_mismatch: id diferente do nome do arquivo ou de --target (subcomando: todos)",
+        "Regras e saídas, saída 2, regra image_ref: envoy.image sem tag ou sem @sha256: de 64 hex (subcomando: todos)",
+        "Regras e saídas, saída 2, regra image_tag: em envoy-X.Y, tag diferente de vX.Y.<patch> (subcomando: todos)",
+        "Regras e saídas, saída 2, regra runtime_image: runtime_image diferente de buildinfo.ImageName (subcomando: todos)",
+        "Regras e saídas, saída 2, regra archs: archs vazio ou com valor fora de amd64 e arm64 (subcomando: todos)",
+        "Regras e saídas, saída 2, regra glibc_format: envoy.glibc fora de ^[0-9]+\\.[0-9]+$ (subcomando: todos)",
+        "Regras e saídas, saída 2, regra target_unsupported: família sem estágio final (istio-* antes da FDD 49) (subcomando: todos)",
+        "Regras e saídas, saída 3, regra catalog_drift: SHA-256 da cópia diferente do arquivo do builder ou de SOURCE.json (subcomando: sync, release)",
+        "Regras e saídas, saída 4, regra tag_format: --tag fora de v<semver> (subcomando: release)",
+        "Regras e saídas, saída 4, regra version_mismatch: --tag sem o v diferente de buildinfo.Version (subcomando: release)",
+        "Regras e saídas, saída 4, regra core_tag_missing: o commit não tem a tag core/v<versão> (subcomando: release)",
+        "Regras e saídas, saída 4, regra core_tag_mismatch: a tag core/v<versão> aponta para outro commit (subcomando: release)",
+        "Regras e saídas, saída 4, regra dirty_tree: árvore de trabalho com alteração (subcomando: release)",
+        "Regras e saídas, saída aviso, regra target_status: status candidate ou deprecated (subcomando: args, release)"
+      ]
+    },
+    {
+      "name": "Contrato 8: conferência do ambiente na subida (internal/imagecheck) e saída 8",
+      "kind": "sdk",
+      "signature_or_route": "package imagecheck // github.com/giustech/n3x-sidecar/internal/imagecheck; só biblioteca padrão e golang.org/x/sys/unix\n\ntype Mode uint8\n\nconst (\n    ModeStandard Mode = iota + 1 // n3x run (Kubernetes, ECS, compose)\n    ModeIstio                    // FDD 49 decide o uso\n)\n\nconst (\n    ExitCode    = 8\n    Code        = \"N3X-S008\"\n    ImageUID    = 17000\n    SOPath      = \"/usr/lib/n3x/libn3x.so\" // igual a config.DefaultSO (teste de igualdade)\n)\n\nvar ErrRunAsRoot = errors.New(\"imagecheck: o n3x run não roda como root\")\n\ntype Options struct {\n    Mode   Mode\n    FS     fs.FS                                       // nil = os.DirFS(\"/\"); lê proc/self/status e proc/self/mountinfo\n    Statfs func(path string) (readOnly bool, err error) // nil = unix.Statfs com ST_RDONLY\n    Access func(path string, mode uint32) error         // nil = unix.Access\n    Geteuid, Getegid func() int                         // nil = os.Geteuid, os.Getegid\n    Getgroups        func() ([]int, error)\n}\n\ntype Report struct {\n    UID, GID       int\n    Groups         []int\n    RootfsReadOnly *bool   // nil = não foi possível saber\n    TmpTmpfs       *bool\n    CapEff, CapBnd *uint64\n    NoNewPrivs     *bool\n    SOWritable     *bool   // nil quando o .so não existe (o pré-voo trata)\n    Warnings       []Warning\n    Duration       time.Duration\n}\n\ntype Warning struct{ Code, Detail string }\n\nfunc Check(opts Options) (Report, error) // nunca dá panic; erro só ErrRunAsRoot",
+      "request_example": "text\ndocker run --rm --user 0 --read-only --tmpfs /tmp -v $PWD/n3x.yaml:/etc/n3x/n3x.yaml:ro n3x-dev/sidecar-teste:dev; echo $?",
+      "response_example": {
+        "stderr": "json\n{\"ts\":\"2026-10-21T14:00:00.002Z\",\"level\":\"error\",\"component\":\"entrypoint\",\"msg\":\"environment_rejected\",\"code\":\"N3X-S008\",\"reason\":\"run_as_root\",\"detail\":\"o n3x run não roda como root (UID 0): use o usuário da imagem (17000:17000) ou outro UID diferente de 0\",\"uid\":0,\"gid\":0,\"exit_code\":8}\n{\"ts\":\"2026-10-21T14:00:00.002Z\",\"level\":\"info\",\"component\":\"entrypoint\",\"msg\":\"supervisor_exit\",\"exit_code\":8,\"reason\":\"run_as_root\",\"orphans_reaped\":0}",
+        "saída de echo $?": "text\n8"
+      },
+      "headers_semantics": [
+        "Tipo declarado: sdk (API Go interna) e código de saída do n3x run",
+        "Método: chamada local, uma vez, no passo 0 do supervisor.Run (depois dos sinais e antes do preflight.Run) (pedido à FDD 27)",
+        "Avisos (sobem): rootfs_writable (raiz sem ST_RDONLY), tmp_not_tmpfs (/tmp sem montagem própria ou com tipo diferente de tmpfs), capabilities_present (CapEff ou CapBnd diferente de 0; o texto diz qual), so_writable (access(SOPath, W_OK) com sucesso). UID diferente de 17000 não gera aviso",
+        "Leitura que falha (sandbox sem /proc): o campo fica nil (null no log) e nenhum aviso sai daquele item",
+        "Custo: até 5 ms e até 4 leituras de arquivo; sem goroutine"
+      ],
+      "status_semantics": [
+        "Recusa (saída 8): UID efetivo 0 no ModeStandard dá ErrRunAsRoot; o supervisor loga environment_rejected (code N3X-S008, reason run_as_root) e sai com 8. Não há chave para liberar (FR-001). validate, encrypt, keygen e help não chamam Check",
+        "Tabela de saídas (contrato 2 da FDD 25 e contrato 1 da FDD 27): a linha 8 deixa de ser \"reservado\" e passa a \"ambiente do container fora do contrato da imagem de runtime (run_as_root)\", dona FDD 28. reason novo só por adição na major",
+        "Como resolver (docs/erros.md#n3x-s008): \"rode com o usuário da imagem (17000:17000) ou outro UID diferente de 0; no Kubernetes, runAsNonRoot: true e sem runAsUser: 0; no compose e no ECS, não defina user: root\""
+      ]
+    },
+    {
+      "name": "Contrato 9: testes da imagem (images/test/)",
+      "kind": "sdk",
+      "signature_or_route": "make image-test TARGET=envoy-1.40 [ARCH=amd64|arm64] [SMOKE=1]\ngo test -tags imagetest ./images/test/... -image <ref ou oci.tar> -arch <arch> [-smoke]\nsaída: out/image-report-<alvo>-<arch>.json e GITHUB_STEP_SUMMARY",
+      "request_example": "text\nmake image-test TARGET=envoy-1.40 ARCH=amd64 SMOKE=1",
+      "response_example": {
+        "out/image-report-envoy-1.40-amd64.json, encurtado": {
+          "format": 1,
+          "target": "envoy-1.40",
+          "arch": "amd64",
+          "image_digest": "sha256:3a91f0c4b8e2...",
+          "base_digest": "sha256:3b1d6f0a...",
+          "own_layers": 2,
+          "own_bytes": 9441280,
+          "n3x_bytes": 9437184,
+          "checks": [
+            {
+              "name": "layout",
+              "ok": true
+            },
+            {
+              "name": "config",
+              "ok": true
+            },
+            {
+              "name": "labels",
+              "ok": true
+            },
+            {
+              "name": "base_layers",
+              "ok": true
+            },
+            {
+              "name": "elf_static",
+              "ok": true
+            }
+          ],
+          "smoke": {
+            "ready_ms": 1840,
+            "no_so_exit": 4,
+            "root_exit": 8,
+            "readonly_no_tmpfs_exit": 6,
+            "hardening_warnings": 0,
+            "stop_exit": 0
+          },
+          "duration_ms": 41210
+        }
+      },
+      "headers_semantics": [
+        "Tipo declarado: suíte de testes (Go com a tag de build imagetest, que chama docker e docker compose) e relatório da CI",
+        "Estrutural (sem executar a imagem, nas duas arquiteturas, sem QEMU): docker create --platform linux/<arch> e docker export do sistema de arquivos; confere o contrato 2 inteiro (caminhos, donos, modos, conteúdo de /etc/n3x/target, /usr/lib/n3x/ vazio, ausência de /tmp/n3x), o ELF do n3x (e_machine da arquitetura, sem PT_INTERP, sem DT_NEEDED), go version -m com CGO_ENABLED=0 e -trimpath, a config OCI (golden por alvo, inclusive o Env herdado), os rótulos do contrato 3 contra imageargs args e buildinfo, as camadas da base iguais às do manifesto da base para a plataforma, até 2 camadas próprias e até 20 MiB",
+        "Fumaça (na arquitetura nativa): usa um .so gerado pela n3x-dev/sidecar-builder (FDD 21), construída a partir de uma ref fixada do n3x-builder (images/test/builder.ref), com SIDECAR_RUNTIME igual à pseudo-versão do commit em teste e GOPRIVATE=github.com/giustech/n3x-sidecar (hipótese H-15); só o plugin core, n3x.yaml mínimo sem plugins, sem controller e sem chave; a aplicação de teste é uma imagem fixada por digest no mesmo namespace de rede (images/test/compose.yaml). Casos no contrato 9 da seção 9",
+        "Frequência (hipótese H-16): estrutural nas duas arquiteturas em todo PR; fumaça amd64 em todo PR; fumaça arm64 em todo push na branch principal, toda noite e obrigatória antes do release. PR de fork sem acesso à pseudo-versão roda a fumaça com o último core/ publicado e avisa no resumo",
+        "Relatório: format: 1, target, arch, image_digest, base_digest, own_layers, own_bytes, n3x_bytes, checks (nome e resultado), smoke (ready_ms, no_so_exit, root_exit, warnings), duration_ms"
+      ]
+    }
+  ],
+  "errors_exceptions_fallback": {
+    "error_matrix": [
+      {
+        "condition": "Cópia do catálogo diferente do builder",
+        "treatment": "saída 3 catalog_drift; PR falha",
+        "notes": "Onde: CI (imageargs sync); Observações: noturna contra a branch principal abre issue"
+      },
+      {
+        "condition": "Catálogo inválido ou alvo sem estágio",
+        "treatment": "saída 2 com a regra",
+        "notes": "Onde: imageargs args; Observações: nada é construído"
+      },
+      {
+        "condition": "Alvo candidate ou deprecated",
+        "treatment": "aviso target_status",
+        "notes": "Onde: imageargs; Observações: publicação decidida pela FDD 46"
+      },
+      {
+        "condition": "Tag, versão ou core/ divergentes no release",
+        "treatment": "saída 4; nada publicado",
+        "notes": "Onde: imageargs release; Observações: version_mismatch, core_tag_missing, core_tag_mismatch, dirty_tree"
+      },
+      {
+        "condition": "Build com QEMU (estágio final com RUN)",
+        "treatment": "o teste estrutural confere que o estágio final não tem RUN (histórico da imagem)",
+        "notes": "Onde: revisão e CI; Observações: regra de \"sem QEMU\""
+      },
+      {
+        "condition": "Base sem a plataforma pedida",
+        "treatment": "build falha",
+        "notes": "Onde: docker buildx; Observações: a regra image_platform da FDD 19 já recusa no catálogo"
+      },
+      {
+        "condition": "Tag já publicada",
+        "treatment": "recusa",
+        "notes": "Onde: publicação (FDD 46); Observações: imutabilidade (ADR-009)"
+      },
+      {
+        "condition": "UID efetivo 0 no n3x run",
+        "treatment": "saída 8 N3X-S008 run_as_root",
+        "notes": "Onde: imagecheck; Observações: antes de qualquer outro passo"
+      },
+      {
+        "condition": "Raiz gravável, capabilities, /tmp fora de tmpfs, .so gravável",
+        "treatment": "hardening_warning; sobe",
+        "notes": "Onde: imagecheck; Observações: um registro por aviso"
+      },
+      {
+        "condition": "/proc ilegível",
+        "treatment": "campos null, sem aviso",
+        "notes": "Onde: imagecheck; Observações: o cgroup tem tratamento próprio na FDD 27"
+      },
+      {
+        "condition": "Sem .so",
+        "treatment": "saída 4 manifest_read",
+        "notes": "Onde: pré-voo (FDD 25); Observações: texto aponta o COPY do estágio final"
+      },
+      {
+        "condition": "/etc/n3x/target escondido por montagem",
+        "treatment": "saída 5 image_target",
+        "notes": "Onde: pré-voo (FDD 25); Observações: texto com a dica de subPath (pedido)"
+      },
+      {
+        "condition": "/tmp sem escrita",
+        "treatment": "saída 6 write",
+        "notes": "Onde: bootstrap (FDD 26); Observações: dica de tmpfs"
+      },
+      {
+        "condition": "Sem limite de memória",
+        "treatment": "saída 7 memory_unlimited",
+        "notes": "Onde: supervisor (FDD 27)"
+      },
+      {
+        "condition": "Chave ou n3x.yaml sem leitura para 17000",
+        "treatment": "saída 3 ou 2",
+        "notes": "Onde: config.Load (FDD 15); Observações: texto com UID e GID (pedido)"
+      },
+      {
+        "condition": "Envoy da base não é o do alvo",
+        "treatment": "saída 5 envoy_mismatch",
+        "notes": "Onde: pré-voo (FDD 25); Observações: o teste estrutural pega antes, pelo rótulo e pelo catálogo"
+      }
+    ],
+    "resilience_strategies": [
+      "Sem rede e sem retry em runtime: a imagem não baixa nada; a conferência do ambiente lê só arquivos locais, sem prazo próprio (até 5 ms)",
+      "No build: a base é fixada por digest, então uma tag do upstream que muda de conteúdo não muda a imagem; o cache do BuildKit é seguro porque o estágio n3x depende só do código e do GO_IMAGE",
+      "Atualização da base: troca de digest só por PR que passa nos testes (sincronia, estrutural e fumaça); a tag anterior continua disponível para rollback (imutável)"
+    ],
+    "fallback_policy": "Nenhum fallback silencioso: sem .so padrão, sem /tmp alternativo, sem descer para outro usuário. O que não cumpre o contrato da imagem ou recusa (saídas 4 a 8) ou aparece como aviso\nO operador volta para a tag anterior (imutável) se um patch da base der problema",
+    "invariants": [
+      "O digest da base da imagem é sempre o envoy.image do catálogo do builder na ref registrada",
+      "A imagem nunca contém /usr/lib/n3x/libn3x.so, /tmp/n3x nem ENV de GOMAXPROCS, GOMEMLIMIT, GODEBUG ou N3X_*",
+      "buildinfo.Version, a tag, o rótulo org.opencontainers.image.version e io.n3x.core.version são o mesmo texto em toda imagem publicada",
+      "/etc/n3x/target e o rótulo io.n3x.target são o mesmo alvo",
+      "O estágio final não tem RUN",
+      "n3x run nunca segue como UID 0"
+    ]
+  },
+  "observability": {
+    "metrics": [
+      "Nenhuma métrica nasce na imagem. As existentes já mostram o par em uso: n3x_build_info{version,target,config_hash} (versão do core/ do .so, FDDs 16 e 22) e as n3x_sidecar_go_* (FDD 27)",
+      "Proposta (pedido à FDD 16, hipótese H-13): gauge n3x_sidecar_image_info{version,target} com valor 1, lida do campo image_version do arquivo de fatos da FDD 25, para ver a versão da imagem de runtime no Prometheus (ela pode ser maior que a do .so)",
+      "Na CI: own_bytes, own_layers, n3x_bytes, ready_ms e duração do build por alvo e arquitetura, no relatório do contrato 9 e no resumo do job"
+    ],
+    "logs": {
+      "format": "Logs (JSON em stderr, component=entrypoint, campos de base da FDD 15)\n\nOrigem da versão e do alvo no log (resposta ao ASSUNTO): a versão vem de buildinfo.Version (constante do n3x, conferida contra a tag no release) e aparece em supervisor_started.version (FDD 27) e container_environment.image_version; o alvo vem de /etc/n3x/target e aparece em manifest_loaded.image_target e preflight_passed.target (FDD 25)\n\nProteção de dados: nenhum caminho de montagem, valor de variável ou conteúdo de arquivo do operador entra nesses eventos",
+      "fields": [
+        "container_environment (nível info): uid, gid, groups, rootfs_readonly, tmp_tmpfs, cap_eff (16 hex), cap_bnd (16 hex), no_new_privs, so_writable, image_version (buildinfo.Version), duration_ms",
+        "hardening_warning (nível warn): code (rootfs_writable, tmp_not_tmpfs, capabilities_present, so_writable), detail",
+        "environment_rejected (nível error): code N3X-S008, reason run_as_root, detail, uid, gid, exit_code"
+      ]
+    },
+    "tracing": {
+      "sampling": "Sem tracing (ADR-009 do n3x-sdk)"
+    },
+    "dashboards_alerts": [
+      "CI: job runtime-image vermelho (estrutural, fumaça ou catalog_sync) bloqueia o merge; a noturna arm64 vermelha abre issue com o rótulo image; catalog_drift contra a branch principal do builder abre issue com o rótulo catalog (hipótese)",
+      "Produção (consulta de log, guia da FDD 47): msg=\"hardening_warning\" agrupado por code; msg=\"environment_rejected\"",
+      "Prometheus (com o pedido à FDD 16): count by (version) (n3x_sidecar_image_info) para acompanhar a troca de versão; alerta info quando mais de 2 versões convivem por 7 dias (hipótese)"
+    ]
+  },
+  "dependencies_compatibility": {
+    "dependencies": [
+      {
+        "component": "Docker Buildx",
+        "min_version": "0.13",
+        "notes": "--platform múltiplo, --output type=oci, rewrite-timestamp"
+      },
+      {
+        "component": "BuildKit e frontend do Dockerfile",
+        "min_version": "BuildKit 0.13; docker/dockerfile:1.10",
+        "notes": "COPY --link, --chmod, --chown, ARG antes do FROM"
+      },
+      {
+        "component": "Imagem base envoyproxy/envoy",
+        "min_version": "v1.40.x fixada por digest do catálogo",
+        "notes": "índice com amd64 e arm64; /usr/local/bin/envoy; getconf (spike IMG-01)"
+      },
+      {
+        "component": "Imagem golang do estágio n3x",
+        "min_version": "1.26.x por digest",
+        "notes": "mesma série da FDD 21"
+      },
+      {
+        "component": "Go",
+        "min_version": "1.26",
+        "notes": "CGO_ENABLED=0, GOAMD64=v1, GOARM64=v8.0"
+      },
+      {
+        "component": "golang.org/x/sys/unix",
+        "min_version": "a já usada pelas FDDs 15 e 27",
+        "notes": "Statfs, Access"
+      },
+      {
+        "component": "n3x-sdk yamlconv",
+        "min_version": "a da release",
+        "notes": "leitura do catálogo no imageargs"
+      },
+      {
+        "component": "n3x-builder targets/<alvo>.yaml",
+        "min_version": "format: 1",
+        "notes": "fonte do digest, da glibc e de archs (FDD 19)"
+      },
+      {
+        "component": "FDD 15 (cmd/n3x, config.DefaultSO)",
+        "min_version": "implementada",
+        "notes": "despacho com ENTRYPOINT e CMD; SOPath igual a DefaultSO"
+      },
+      {
+        "component": "FDD 25 (core/buildinfo, ReadImage)",
+        "min_version": "implementada",
+        "notes": "Version, Module, ImageName; formato de /etc/n3x/target"
+      },
+      {
+        "component": "FDD 26 (internal/bootstrap)",
+        "min_version": "implementada",
+        "notes": "cria /tmp/n3x; usa /usr/local/bin/envoy"
+      },
+      {
+        "component": "FDD 27 (internal/supervisor)",
+        "min_version": "implementada, com o pedido desta",
+        "notes": "passo 0 com imagecheck.Check"
+      },
+      {
+        "component": "FDD 29 (health)",
+        "min_version": "para o critério de /ready",
+        "notes": "até lá, o pronto é o log envoy_ready"
+      },
+      {
+        "component": "FDD 21 (n3x-dev/sidecar-builder)",
+        "min_version": "implementada",
+        "notes": "gera o .so do teste de fumaça e do M2"
+      },
+      {
+        "component": "FDD 46",
+        "min_version": "consumidora",
+        "notes": "publicação no GHCR e tabela de pares"
+      },
+      {
+        "component": "Runners do GitHub Actions",
+        "min_version": "ubuntu-24.04 e ubuntu-24.04-arm",
+        "notes": "fumaça nativa (hipótese H-16)"
+      },
+      {
+        "component": "Kubernetes, ECS, docker compose",
+        "min_version": "Kubernetes 1.29; Docker 20.10",
+        "notes": "readOnlyRootFilesystem, tmpfs, drop: ALL"
+      },
+      {
+        "component": "Item IMG-01 do spike da fase 0 (hipótese até rodar)",
+        "notes": "O que confirmar: Usuário, ENTRYPOINT, ENV, rótulos e caminho do binário da envoyproxy/envoy:v1.40.x; presença de getconf; onde é usado: contratos 2 e 3"
+      },
+      {
+        "component": "Item IMG-02 do spike da fase 0 (hipótese até rodar)",
+        "notes": "O que confirmar: Envoy 1.40 sobe como 17000 sem entrada no /etc/passwd, com --read-only, tmpfs em /tmp, --cap-drop ALL e no-new-privileges, carregando o .so do core; onde é usado: contrato 4"
+      },
+      {
+        "component": "Item IMG-03 do spike da fase 0 (hipótese até rodar)",
+        "notes": "O que confirmar: Perfil seccomp RuntimeDefault não bloqueia o Envoy nem o runtime Go do .so; onde é usado: contrato 4"
+      },
+      {
+        "component": "Item IMG-04 do spike da fase 0 (hipótese até rodar)",
+        "notes": "O que confirmar: rewrite-timestamp=true com COPY --link gera o mesmo digest em dois runners; onde é usado: objetivo \"Reproduzível\""
+      },
+      {
+        "component": "Item IMG-05 do spike da fase 0 (hipótese até rodar)",
+        "notes": "O que confirmar: docker create --platform linux/arm64 e docker export funcionam num host amd64 sem binfmt; onde é usado: contrato 9"
+      },
+      {
+        "component": "Item IMG-06 do spike da fase 0 (hipótese até rodar)",
+        "notes": "O que confirmar: n3x estático com -s -w fica abaixo de 15 MiB e o rastro de pilha continua com nome de função; onde é usado: contrato 2"
+      }
+    ],
+    "compatibility_guarantees": [
+      "Caminhos, donos, modos, User, Entrypoint, Cmd e portas fixos na major da imagem; arquivo novo só por adição em minor",
+      "Formato de /etc/n3x/target fixo na major (FDD 25); informação nova vai em arquivo novo",
+      "Rótulos só por adição; os io.n3x.* não mudam de sentido",
+      "Saída 8 e o reason run_as_root fixos na major; reason novo e aviso novo só por adição, em minor com nota",
+      "Uma tag publicada nunca muda; o operador que fixa por digest tem o mesmo conteúdo para sempre",
+      "O estágio runtime-istio (FDD 49) reaproveita n3x e files sem mudar o runtime-envoy"
+    ]
+  },
+  "acceptance_criteria": [
+    "Build multi-arquitetura sem QEMU: num runner amd64 com binfmt vazio, make runtime-image TARGET=envoy-1.40 gera um índice OCI com linux/amd64 e linux/arm64; o histórico do estágio final não tem RUN",
+    "Base por digest e sincronia: imageargs sync dá 0 contra o arquivo do builder na ref; trocar um byte da cópia dá saída 3 catalog_drift; o rótulo org.opencontainers.image.base.digest é igual ao digest do catálogo; as camadas da base, por plataforma, são iguais às do manifesto da base, na mesma ordem",
+    "Mesma glibc (pedido da FDD 23): docker run --entrypoint getconf <imagem> GNU_LIBC_VERSION mostra envoy.glibc do catálogo, em amd64 e arm64 nativos; io.n3x.glibc tem o mesmo valor",
+    "Layout: teste estrutural com 100% das linhas do contrato 2 nas duas arquiteturas: /etc/n3x/target com exatamente envoy-1.40\\n (11 bytes) e modo 0444 dono 0:0; /usr/lib/n3x/ vazio com 0755; /run/n3x/ vazio; /tmp/n3x ausente; nenhum outro caminho diferente da base",
+    "Binário: /usr/local/bin/n3x ELF da arquitetura certa, sem PT_INTERP e sem DT_NEEDED; go version -m mostra CGO_ENABLED=0, -trimpath e o módulo; até 15 MiB (hipótese)",
+    "Configuração: User 17000:17000; Entrypoint [\"/usr/local/bin/n3x\"]; Cmd [\"run\"]; Env igual ao golden, com ENVOY_DYNAMIC_MODULES_SEARCH_PATH=/usr/lib/n3x e sem nenhuma variável proibida do contrato 2; portas 17000, 17021 e 17090; StopSignal SIGTERM; sem Healthcheck, Volumes e OnBuild",
+    "Rótulos: os 15 rótulos do contrato 3 presentes, com version e io.n3x.core.version iguais a buildinfo.Version, io.n3x.target igual ao conteúdo de /etc/n3x/target, licenses Apache-2.0",
+    "Tamanho: até 2 camadas próprias e até 20 MiB descomprimidos somados (hipótese)",
+    "Fumaça com .so (core, n3x.yaml mínimo, 1 vCPU e 256 MiB, --read-only, tmpfs em /tmp, --cap-drop ALL, no-new-privileges, usuário padrão): 3 subidas por arquitetura, cada uma com envoy_ready em até 5 s (com a FDD 29, 17021/ready 200 em até 5 s); GET :17000/ chega à aplicação de teste com 200; GET :17090/stats/prometheus tem n3x_build_info com target=\"envoy-1.40\"; 0 hardening_warning; container_environment com uid 17000, rootfs_readonly true, tmp_tmpfs true, cap_eff e cap_bnd zerados; runtime_computed.memory_source com cgroup_v2 ou cgroup_v1; docker stop sai com 0",
+    "Fumaça sem .so: a mesma imagem sem o COPY sai com 4 em até 2 s, com N3X-S004, manifest_read e o caminho /usr/lib/n3x/libn3x.so no stderr, e sem envoy_started",
+    "Root recusado: --user 0 sai com 8 em até 1 s, com environment_rejected e sem nenhum manifest_loaded; --user 0 com keygen sai com 0",
+    "Sem endurecimento: sem --read-only e sem --cap-drop o sidecar sobe e loga exatamente rootfs_writable e capabilities_present; com COPY --chown=17000 do .so, so_writable",
+    "Raiz somente leitura sem tmpfs: saída 6 write (FDD 26)",
+    "Subcomandos pela imagem: docker run --rm <imagem> keygen imprime uma chave de 44 caracteres e sai com 0 como 17000 com --read-only; docker run --rm -i <imagem> encrypt --key /run/n3x/aes.key --service pedidos funciona com a chave montada; docker run --rm <imagem> --config /etc/n3x/n3x.yaml entra no run",
+    "Montagem que esconde o alvo: diretório montado em /etc/n3x dá saída 5 image_target",
+    "Imagem local do M2: make runtime-image-dev gera n3x-dev/sidecar:dev-envoy-1.40 com --load, e o Dockerfile do operador do M2 (FDD 21) com essa imagem passa na fumaça",
+    "Gate de release: imageargs release dá 0 só com v<buildinfo.Version> e core/v<buildinfo.Version> no mesmo commit, árvore limpa e catálogo sincronizado; cada regra de saída 4 tem teste",
+    "imageargs: teste de tabela por regra do contrato 7; leitura tolerante com campo desconhecido no catálogo dá 0; VERSION nunca vem de flag",
+    "imagecheck: testes de tabela com /proc falso para cada aviso, para nil em leitura que falha e para ErrRunAsRoot; SOPath == config.DefaultSO; até 5 ms (benchmark); cobertura de linhas de no mínimo 90% (hipótese, igual às FDDs anteriores)",
+    "Reprodutível: dois builds do mesmo commit em runners diferentes dão o mesmo digest de manifesto por plataforma (hipótese; contingência: mesmos diffID das 2 camadas próprias)",
+    "Segurança: govulncheck ./... do módulo raiz sem vulnerabilidade chamada no release (no PR, só relatório); gosec ./cmd/... ./internal/... ./images/tools/... sem achado de severidade alta, exceção só com #nosec e motivo",
+    "Tempo de build (hipótese H-17): imagem de um alvo nas duas arquiteturas em até 60 s com cache e até 4 min sem cache num runner amd64 padrão"
+  ],
+  "risks": [
+    {
+      "risk": "Base do Envoy fixada por digest fica desatualizada e acumula vulnerabilidades",
+      "mitigation": [
+        "Patch do Envoy 1.40.x detectado e promovido no catálogo pela FDD 46; PR automático no n3x-sidecar copia o catálogo e sobe o patch de buildinfo.Version",
+        "COPY --link deixa as camadas próprias iguais entre patches, então o PR só muda a base",
+        "Varredura informativa da imagem na noturna (hipótese: trivy image, sem bloquear), com issue para CVE crítico da base"
+      ],
+      "probability": "high",
+      "impact": "CVEs conhecidos do Envoy ou do sistema base em produção",
+      "contingency_plan": "release patch fora de ciclo só com a troca da base; o operador fixa a tag nova por digest"
+    },
+    {
+      "risk": "Imagem e .so de versões incompatíveis combinados pelo operador",
+      "mitigation": [
+        "Recusa no pré-voo com a imagem indicada (FDD 25)",
+        "Tabela de pares no README do builder (FDD 46) e rótulos io.n3x.core.version e io.n3x.target para conferir com docker inspect"
+      ],
+      "probability": "medium",
+      "impact": "o sidecar não sobe",
+      "contingency_plan": "usar a imagem da mensagem ou recompilar com a sidecar-builder do mesmo core/"
+    },
+    {
+      "risk": "Chave AES e n3x.yaml montados sem leitura para o UID 17000",
+      "mitigation": [
+        "Texto do erro com UID e GID do processo (pedido à FDD 15)",
+        "Guia com fsGroup: 17000 e defaultMode: 0440 no Kubernetes, e dono ou grupo 17000 no compose e no ECS (FDD 47)"
+      ],
+      "probability": "high",
+      "impact": "saída 3 ou 2 na primeira subida, principalmente em compose com arquivo do host em modo 0400",
+      "contingency_plan": "user: \"17000:<gid do arquivo>\" no compose"
+    },
+    {
+      "risk": "Diretório montado em /etc/n3x esconde /etc/n3x/target",
+      "mitigation": [
+        "Texto do image_target com a dica de subPath (pedido à FDD 25)",
+        "Exemplos da FDD 47 sempre com subPath ou arquivo"
+      ],
+      "probability": "medium",
+      "impact": "saída 5 image_target em quem monta o ConfigMap como diretório",
+      "contingency_plan": "montar o ConfigMap em outro diretório e usar --config; numa major futura, mover o alvo para /usr/share/n3x (ponto P-02)"
+    },
+    {
+      "risk": "Cópia do catálogo diverge do builder",
+      "mitigation": [
+        "catalog-sync em todo PR e no release, contra a ref de SOURCE.json",
+        "Noturna contra a branch principal do builder, com issue"
+      ],
+      "probability": "medium",
+      "impact": "runtime com glibc ou Envoy diferentes dos verificados pelo builder",
+      "contingency_plan": "release patch com a cópia corrigida; a tag anterior continua disponível"
+    },
+    {
+      "risk": "Patch da base muda usuário, ENTRYPOINT, ENV ou caminho do Envoy",
+      "mitigation": [
+        "Golden da config e do Env herdado; teste estrutural falha em qualquer diferença",
+        "ENTRYPOINT, CMD e USER sempre declarados no estágio final"
+      ],
+      "probability": "low",
+      "impact": "imagem quebrada ou com variável inesperada no ambiente",
+      "contingency_plan": "manter a base anterior e abrir issue no upstream; ajustar o golden só com revisão"
+    },
+    {
+      "risk": "Recusa de root quebra quem já roda o sidecar como root",
+      "mitigation": [
+        "A imagem nunca rodou como root por padrão; a recusa existe desde a primeira versão",
+        "Texto com a correção por orquestrador"
+      ],
+      "probability": "low",
+      "impact": "saída 8 depois de atualizar a imagem",
+      "contingency_plan": "nenhuma chave de escape (FR-001); o operador remove o user: root"
+    },
+    {
+      "risk": "Tag republicada ou móvel quebra a reprodutibilidade do operador",
+      "mitigation": [
+        "Sem tags móveis; publicação recusa tag existente (FDD 46)",
+        "Guia recomenda fixar por digest"
+      ],
+      "probability": "low",
+      "impact": "o mesmo Dockerfile gera imagens diferentes",
+      "contingency_plan": "se uma tag for sobrescrita por erro, publicar um patch novo e registrar o incidente"
+    },
+    {
+      "risk": "Acoplamento da versão da imagem ao core/ gera releases sem mudança de código",
+      "mitigation": [
+        "Nota de release diz \"só base\"; a regra do ADR-001 ignora patch, então .so antigos continuam aceitos"
+      ],
+      "probability": "high",
+      "impact": "tags core/vX.Y.Z novas só por troca de base; ruído para quem acompanha o módulo",
+      "contingency_plan": "numa major, separar a versão da imagem da versão do core/ com um arquivo de imagem como o image.json do controller (ponto P-01)"
+    }
+  ]
+}
