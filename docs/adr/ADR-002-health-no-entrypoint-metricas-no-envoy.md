@@ -24,3 +24,7 @@ O ADR-006 do `n3x-sdk` fixou as portas de health (`17021`) e de métricas (`1709
 
 ## Requisitos relacionados
 FR-003; observabilidade nos requisitos não funcionais.
+
+## Nota de revisão (2026-10-22)
+- O admin do Envoy passou para o socket Unix `/tmp/n3x/admin.sock` (modo 0600), sem porta TCP (SID-06; decisão aprovada na validação de consistência). O `/ready` do admin e a rota `GET /metrics` da `17090` continuam como decididos aqui; a `17090` chega ao admin pelo cluster `admin` com endereço `pipe`
+- A `17021` ganhou `POST /drain`, aceito só de loopback, como gatilho opcional de drenagem pela aplicação (SID-09)

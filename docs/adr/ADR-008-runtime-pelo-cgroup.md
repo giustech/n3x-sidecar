@@ -23,3 +23,8 @@ O runtime Go e o Envoy dividem CPU e memória no mesmo cgroup. `GOMAXPROCS` prec
 
 ## Requisitos relacionados
 FR-001; desempenho e confiabilidade nos requisitos não funcionais.
+
+## Nota de revisão (2026-10-22)
+- Sem limite de CPU no cgroup e sem `resources.cpus`: `CPU = min(afinidade, 2)`, com o aviso `cpu_unlimited`; o teto de 2 é revisto pelo benchmark (SID-07 e SID-12)
+- `resources` e o cgroup valem juntos: vale o menor dos dois; memória abaixo de 128 MiB recusa a subida e abaixo de 256 MiB só avisa (SID-07)
+- O exemplo de `GOMAXPROCS` do FR-001 no PRD foi alinhado a esta decisão

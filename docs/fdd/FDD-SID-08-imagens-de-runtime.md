@@ -64,6 +64,12 @@ Quem consome:
   - FDD 25: `/etc/n3x/target` igual a `<id>\n` com modo 0444; release falha se a tag da imagem ou `core/vX.Y.Z` diferir de `buildinfo.Version`; saída 8 decidida (contratos 2, 7 e 8)
   - FDD 26: `/usr/local/bin/envoy`, `ENV ENVOY_DYNAMIC_MODULES_SEARCH_PATH=/usr/lib/n3x`, sem `/tmp/n3x` na imagem (contrato 2)
 
+**Clarificações (2026-10-22)**
+- Refinos pedidos por FDDs posteriores (validação de consistência de 2026-10-22): o texto desta FDD continua valendo com os acréscimos e mudanças abaixo; em conflito, vale o contrato da FDD citada em cada item
+  - SID-11 (FDD 49), contrato 11: estágio `runtime-istio` (base `istio/proxyv2`, `USER 1337:1337`, sem `EXPOSE`, rótulo `io.n3x.istio.version`) e a semântica do `imagecheck` em `ModeIstio` (P-03): UID 0 sai com 8 e UID diferente de 1337 só avisa (`istio_uid_unexpected`)
+  - SID-12 (FDD 50), contrato 8: o release do sidecar só publica com o `n3x-bench gate` verde (status `n3x-bench/release`)
+- `ENTRYPOINT ["/usr/local/bin/n3x"]` com `CMD ["run"]` (I-01): aplicado ao HLD e registrado no ADR-003 na validação de consistência
+
 ---
 
 ### 2. Objetivos técnicos

@@ -68,6 +68,12 @@ Quem consome:
   - FDD 38: `ExitContext` sem mudança; a conexão continua viva porque o processo do Envoy está vivo durante toda a janela de saída (contrato 7)
   - FDD 06: o fim das tarefas de fundo começa no `stop` do canal de controle, antes do SIGTERM ao Envoy (contrato 4)
 
+**Clarificações (2026-10-22)**
+- Gatilho de drenagem pela aplicação (ponto P-01, hipótese H-12, inconsistência I-02): mantém ou retira o `POST /drain`? → Mantém, como mecanismo **opcional**: `POST http://127.0.0.1:17021/drain`, aceito só de loopback (contratos 1 e 10). A meta "zero requisições cortadas em rolling update" com conexões persistentes de clientes é validada com o gatilho; sem ele, a limitação (503 nas requisições que chegam entre a saída da aplicação e o SIGTERM do sidecar) fica documentada no guia (FDD 47). Usar o gatilho é opcional para a aplicação; quem não usa não precisa mudar código. O reflexo no texto do PRD (meta de disponibilidade e meta de "zero linhas de código da aplicação") foi aplicado ao PRD na validação de consistência de 2026-10-22.
+- Refinos pedidos por FDDs posteriores (validação de consistência de 2026-10-22): o texto desta FDD continua valendo com os acréscimos e mudanças abaixo; em conflito, vale o contrato da FDD citada em cada item
+  - SID-11 (FDD 49), contrato 8: valores novos de `drain.Source` (`istio_admin` e `istio_prestop`), `ServeWith` com `ServeOptions{Peer}` e `PeerSameExe` (par aceito pelo executável `/usr/local/bin/n3x`, para o preStop `n3x istio-drain`)
+- Ordem dos 2 s dos plugins antes do SIGTERM ao Envoy (I-01), canal de controle (L-18) e subcomando `n3x probe` (L-17): aplicados ao HLD e registrados nos ADR-006 e ADR-003 na validação de consistência
+
 ---
 
 ### 2. Objetivos técnicos
@@ -136,7 +142,7 @@ Quem consome:
 7. **Saída.** Loga `drain_completed` com `exit_code`, `reasons`, `wait_ms`, `stop_ms`, `envoy_stop_ms` e `total_ms`, e devolve 0 ou 9. A FDD 27 loga `supervisor_exit` (`reason` `drained` para 0 e `lifecycle` para 9) e sai. O `17021` responde até o fim (é fechado quando o `ctx` do supervisor é cancelado na saída).
 
 **Fluxos alternativos e exceções**
-- **Drenagem pedida pela aplicação** (`POST /drain` vindo de loopback, contrato 1; hipótese H-12): roda os passos 1 a 4 com `source` `app` e responde 202 na hora (sem esperar). Ao fim da espera, o entrypoint não para nada: fica em `draining` esperando o SIGTERM. Quando o SIGTERM chega, `Drain` vê a drenagem em curso, não repete os passos 1 a 3, espera o que falta até `t0 + T` (contado a partir do pedido da aplicação) com a mesma regra do passo 4 e segue para os passos 5 a 7. É o caminho para o sidecar fechar as conexões dos clientes enquanto a aplicação ainda atende, já que nos três orquestradores a aplicação desce primeiro (I-02)
+- **Drenagem pedida pela aplicação** (`POST /drain` vindo de loopback, contrato 1; opcional, decidido na clarificação de 2026-10-22): roda os passos 1 a 4 com `source` `app` e responde 202 na hora (sem esperar). Ao fim da espera, o entrypoint não para nada: fica em `draining` esperando o SIGTERM. Quando o SIGTERM chega, `Drain` vê a drenagem em curso, não repete os passos 1 a 3, espera o que falta até `t0 + T` (contado a partir do pedido da aplicação) com a mesma regra do passo 4 e segue para os passos 5 a 7. É o caminho para o sidecar fechar as conexões dos clientes enquanto a aplicação ainda atende, já que nos três orquestradores a aplicação desce primeiro (I-02)
 - **`POST /drain` antes do pronto:** 409 `starting`; nada muda
 - **`POST /drain` vindo de outro endereço:** 403 `forbidden`, log `drain_trigger_rejected` (no máximo 1 por minuto); nada muda
 - **Segundo SIGTERM ou SIGINT:** cada sinal extra avança no máximo uma fase: na espera, termina a espera; no `stop`, deixa de esperar a resposta; no SIGTERM ao Envoy, só loga (`signal_received` com `action` `forward_drain` é da FDD 27). A saída fica 9 (`forced`) (hipótese H-11)
@@ -225,7 +231,7 @@ flowchart LR
   - **Corpo:** uma palavra e `\n`, `Content-Type: text/plain; charset=utf-8`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`; `HEAD` devolve o mesmo status sem corpo. Nenhum detalhe da aplicação, do Envoy ou da config no corpo
   - **`/live`** (hipótese H-04): 200 `ok` desde o `Serve` até a saída do processo, inclusive na drenagem; 503 `envoy_exited` entre a morte do Envoy em serviço e a saída do entrypoint (até 100 ms). Não consulta o admin nem a aplicação: um Envoy lento ou uma aplicação fora do ar não devem levar o orquestrador a reiniciar o sidecar
   - **`/ready`:** 200 `ready` só com as três condições do ADR-002; senão 503 com o estado (`starting`, `app_unhealthy`, `envoy_not_ready`, `draining`), com precedência `draining`, `starting`, `envoy_not_ready`, `app_unhealthy`. Responde do estado em memória, sem I/O por requisição
-  - **`/drain`** (hipótese H-12, ponto P-01): só aceito se o par TCP for loopback (`127.0.0.0/8`, `::1` ou `::ffff:127.0.0.0/104`); 202 `draining` na primeira vez e nas seguintes (idempotente); 409 `starting` antes do pronto; 403 `forbidden` de outro endereço; corpo da requisição ignorado (até 1 KiB lido). Quem chama: a aplicação do mesmo pod ou task, no próprio tratamento de SIGTERM ou num `preStop`. Um plugin dentro do Envoy também seria par loopback, por isso a `17021` entra em `envoycfg.ReservedLoopbackPorts` (abaixo)
+  - **`/drain`** (opcional para a aplicação; decidido na clarificação de 2026-10-22, antes hipótese H-12 e ponto P-01): só aceito se o par TCP for loopback (`127.0.0.0/8`, `::1` ou `::ffff:127.0.0.0/104`); 202 `draining` na primeira vez e nas seguintes (idempotente); 409 `starting` antes do pronto; 403 `forbidden` de outro endereço; corpo da requisição ignorado (até 1 KiB lido). Quem chama: a aplicação do mesmo pod ou task, no próprio tratamento de SIGTERM ou num `preStop`. Um plugin dentro do Envoy também seria par loopback, por isso a `17021` entra em `envoycfg.ReservedLoopbackPorts` (abaixo)
   - **Outros:** método errado dá 405 com `Allow: GET, HEAD` (ou `Allow: POST` em `/drain`); outra rota dá 404 `not_found`
   - **Limites do servidor** (hipótese H-17): `ReadHeaderTimeout` 2 s, `ReadTimeout` 5 s, `WriteTimeout` 5 s, `IdleTimeout` 30 s, `MaxHeaderBytes` 8 KiB, até 128 conexões simultâneas (as seguintes esperam o `accept`); só HTTP/1.1; tempo de resposta abaixo de 1 ms no p99 ocioso
   - **Porta fixa:** `17021` (ADR-006 do `n3x-sdk`, `config.ReservedPorts` da FDD 15); sem campo no `n3x.yaml`
@@ -716,7 +722,7 @@ listener.n3x_ingress.downstream_cx_active: 0
 | docker compose | `healthcheck` `["CMD","/usr/local/bin/n3x","probe","live"]` | não há balanceador; os clientes recebem `GOAWAY` e `Connection: close` | `stop_grace_period` maior ou igual a `drain_timeout` mais 10 s (o padrão do compose, 10 s, corta a drenagem) |
 
   - **Nunca `/ready` em `startupProbe`, nem no health check usado por `dependsOn` `HEALTHY` ou `depends_on: service_healthy`:** o `/ready` exige a aplicação aprovada, e a aplicação só sobe depois do sidecar; o resultado é um impasse na subida
-  - **Gatilho pela aplicação** (hipótese H-12, ponto P-01): para não cortar conexões persistentes de clientes, a aplicação, ao receber SIGTERM, chama `POST http://127.0.0.1:17021/drain`, continua atendendo por `drain_timeout` ou até as requisições em voo acabarem, e só então sai. Sem isso, no Kubernetes e no ECS o sidecar só drena depois que a aplicação saiu (I-02), e requisições em conexões persistentes (gRPC sem balanceamento no cliente, HTTP/1.1 com keep-alive via `kube-proxy`) que chegarem entre a saída da aplicação e o SIGTERM do sidecar recebem 503
+  - **Gatilho pela aplicação** (opcional; decidido na clarificação de 2026-10-22, antes hipótese H-12 e ponto P-01): para não cortar conexões persistentes de clientes, a aplicação, ao receber SIGTERM, chama `POST http://127.0.0.1:17021/drain`, continua atendendo por `drain_timeout` ou até as requisições em voo acabarem, e só então sai. Sem isso, no Kubernetes e no ECS o sidecar só drena depois que a aplicação saiu (I-02), e requisições em conexões persistentes (gRPC sem balanceamento no cliente, HTTP/1.1 com keep-alive via `kube-proxy`) que chegarem entre a saída da aplicação e o SIGTERM do sidecar recebem 503
   - **Sinal de parada:** a imagem usa `STOPSIGNAL SIGTERM` (FDD 28); SIGINT (`docker run -it`, Ctrl+C) tem o mesmo efeito, e o segundo Ctrl+C encurta a drenagem
 
 **Exemplo de requisição** (trecho do pod)
@@ -955,7 +961,7 @@ $ kubectl logs pedidos-7d9f8b-xk2lp -c n3x | jq -c 'select(.msg|test("ready_chan
     - Gatilho `POST /drain` pela aplicação, documentado com exemplo (contrato 10)
     - Espera mínima de 3 s e `--drain-strategy immediate` para os clientes reconectarem cedo
     - Teste de rolling update com e sem o gatilho (critério informativo)
-- **Plano de contingência:** se o usuário recusar o gatilho (P-01), registrar a limitação no guia e rever o ADR-007 do `n3x-sdk` (sidecar como container comum, que recebe SIGTERM junto com a aplicação)
+- **Plano de contingência:** o gatilho foi aprovado como opcional (clarificação de 2026-10-22); para quem não o usa, a limitação fica registrada no guia. Se o gatilho se mostrar insuficiente na prática, rever o ADR-007 do `n3x-sdk` (sidecar como container comum, que recebe SIGTERM junto com a aplicação)
 
 ### Canal de controle indisponível perde o evento e corta os plugins
 

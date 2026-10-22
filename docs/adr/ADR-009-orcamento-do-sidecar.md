@@ -22,3 +22,8 @@ O ADR-010 do `n3x-sdk` manda dividir as metas do sistema por componente no HLD d
 
 ## Requisitos relacionados
 Desempenho nos requisitos não funcionais; FR-003, FR-004.
+
+## Nota de revisão (2026-10-22)
+- A meta de cruzamentos passa a ser "até 5 entradas do Envoy no Go com trabalho da cadeia por requisição". Criação, destruição, pedaços de body e trailers sempre entram no Go pelo ABI de dynamic modules e são passagens O(1), sem alocação (SID-02, I-01; PRD atualizado)
+- Unidade de memória: MiB (PRD atualizado)
+- O orçamento ocioso ganha a parcela do entrypoint (supervisor e health): até 20 MiB e 0,005 vCPU (hipótese; SID-07 e SID-09). As parcelas somam 120 MiB e 0,055 vCPU, acima da meta: a meta dura continua sendo o total do container (100 MiB e 0,05 vCPU), e as parcelas são rebalanceadas pelo benchmark (regra S5 da SID-12) antes da v1

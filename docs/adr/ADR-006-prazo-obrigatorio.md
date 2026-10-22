@@ -22,3 +22,8 @@ Sem prazo, um upstream lento segura goroutines, memória e conexões até derrub
 
 ## Requisitos relacionados
 FR-002, FR-003, FR-004, FR-012; confiabilidade nos requisitos não funcionais.
+
+## Nota de revisão (2026-10-22)
+- Requisição gRPC à aplicação: o prazo é o `grpc-timeout` do cliente, com teto de 1 h; sem ele, vale `app.timeouts.request` (15 s); o estouro sai como `DEADLINE_EXCEEDED` (SID-06)
+- Chamada unária ao controller: o teto é `min(prazo do ctx, controller.timeouts.call)`, com padrão de 5 s e faixa de 100 ms a 60 s; o login usa `controller.timeouts.login` (10 s); stream não tem teto total (SID-10, L-08)
+- Ordem do desligamento: os 2 s de encerramento dos plugins começam antes do SIGTERM ao Envoy, pelo canal de controle, e o SIGTERM só sai com a confirmação do `.so` ou em 3 s; o SIGKILL continua 5 s depois do SIGTERM ao Envoy; total máximo de `runtime.drain_timeout` mais 9 s (SID-09)

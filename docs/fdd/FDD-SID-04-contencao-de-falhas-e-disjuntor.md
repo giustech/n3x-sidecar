@@ -79,6 +79,12 @@ Consumidores:
   - FDD 38 (P-07 e H-16 dela): implementação de `core/internal/ctxmark` na forma do contrato 9 dela e marcação do `ctx` de toda função do `Go()` (`WithRequest`) e de toda tarefa de fundo (`WithBackground`), que é como a visão do `Env` detecta `proxy.ErrRequestPath` e aplica o teto só nas unárias (contratos 5, 7 e 9); `Containment.Stop` termina antes do `Stop` da conexão, para a saída do core usar a conexão viva
   - Coordenação da FDD 07 (refinos R1 a R9): `Reset(g, req, hasBody, isGRPC)`, `SetBodyOverLimit`, `Denier()` com `Denial`, `MaxGroupLen()`, `Guard.After` também sem chamada (R5) e `Guard.Before` também no `OnComplete` (R6); instância com disjuntor aberto não roda nenhum hook da requisição, nem `OnComplete`
 
+**Clarificações (2026-10-22)**
+- Refinos pedidos por FDDs posteriores (validação de consistência de 2026-10-22): o texto desta FDD continua valendo com os acréscimos e mudanças abaixo; em conflito, vale o contrato da FDD citada em cada item
+  - SID-09 (FDD 29), contrato 1: a porta `17021` entra em `envoycfg.ReservedLoopbackPorts` e passa a ser negada ao `env.Dial` sem mudança de código
+  - SID-11 (FDD 49), contrato 6: `fault.DenyList` junta aos destinos do sidecar os destinos reservados do alvo (`ProcessSettings.TargetDeny`: portas e diretórios do Istio); no modo Istio, `ListenerPort` é 0
+- Os refinos F1 a F3 que esta FDD pediu à SID-03 ficaram registrados na nota de refinos dela; L-70 e L-71 foram refletidas no PRD (FR-004) e no ADR-004 na validação de consistência
+
 ---
 
 ### 2. Objetivos técnicos

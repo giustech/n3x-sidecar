@@ -85,6 +85,16 @@ Consumidores:
   - FDD 26: config do filtro inerte na validação, sem `New`, tarefas, `Stop` nem controller (contrato 3)
   - FDD 09: instância única do core, `CoreEnv` com `Sidecar()`, `ConfigInput`, eventos da subida pela `EventQueue` e `CheckPrivileged` com o par (ID, módulo) do registro gerado, conferido com `plugins[].module` do manifesto embutido (contratos 1, 3, 5 e 9)
 
+**Clarificações (2026-10-22)**
+- Refinos pedidos por FDDs posteriores (validação de consistência de 2026-10-22): o texto desta FDD continua valendo com os acréscimos e mudanças abaixo; em conflito, vale o contrato da FDD citada em cada item
+  - SID-04 (FDD 18), contrato 4: refinos F1 a F3 das portas: `Containment.Configure(ProcessSettings)` (com `Platform`, `Log`, `Breaker` e `ListenerPort`), `Launch(a *Async) sdkchain.Cause` no lugar de `bool` e `requestID` em `Panicked` e `Failed`; regra nova `containment_config` no `Build`
+  - SID-05 (FDD 25), contrato 8: `SidecarParts.Identity` com a assinatura `func(cfg *config.Config) (proxy.SidecarIdentity, error)`, chamada no `Build` em `ModeServe` depois do `config.Load`; a fonte de produção é `entry.NewSelfPreflight(...).Source`
+  - SID-09 (FDD 29), contrato 6: `core/entry` cria o `drain.Server`, passa `srv.Drain` em `SidecarParts.Drain` e entrega o servidor ao adaptador
+  - SID-10 (FDD 38), contrato 2: `ControllerProvider.Configure(ControllerInput)` chamado no `Build` em `ModeServe` logo depois do `config.Load` e do `Telemetry().Configure`; se o `Build` falhar depois do `Configure`, o executor chama `ctl.Stop` com prazo curto
+  - SID-11 (FDD 49), contrato 6: `ProcessSettings.ListenerPort` 0 e `ProcessSettings.TargetDeny = h.Reserved()` no modo Istio
+  - SID-01 (FDD 15), contrato 2: o recorte impossível sai como `config_warning` com `code` `match_unreachable` do `Report` do `config.Load`; o evento próprio `match_unreachable` do executor (contrato 8 e seção 7) não é emitido, para não duplicar; o arquivo de referência da SID-01 já não tem o recorte impossível citado no contrato 8 (I-10)
+- `OnComplete` para toda instância do recorte (I-01): aplicado ao HLD na validação de consistência
+
 ---
 
 ### 2. Objetivos técnicos

@@ -32,7 +32,7 @@ máquina dedicada n3x-perf (amd64, Linux, cgroup v2, SMT desligado)
 
 **Suposições**
 - As FDDs 15 a 29, 38 e o plugin core estão implementados na versão medida; o `.so` sai do `n3x-plugin build` com o core e o `n3x.example` (FDD 48, `combo.json`)
-- Os "MB" do PRD e do ADR-009 são lidos como MiB, igual à FDD 51; com isso o teto ocioso é 100 MiB (hipótese, ponto P-02)
+- A meta ociosa é de 100 MiB, igual à FDD 51 (decidido na clarificação de 2026-10-22, antes ponto P-02; o PRD e o ADR-009 passaram a dizer MiB)
 - Go 1.26 no `.so` aplica o `GOMAXPROCS` e o `GOMEMLIMIT` recebidos do entrypoint (FDD 27); dentro do container de 1 vCPU, o Envoy roda com `--concurrency 1` e o Go com `GOMAXPROCS` 2
 - O runner auto-hospedado `n3x-perf` é o mesmo da FDD 51, sem outra carga durante a execução (hipótese de infraestrutura, ponto P-01)
 - O `n3x.yaml` aceita a seção `plugins` vazia (só o core implícito), usada no cenário "sem plugins" (hipótese H-23, pedido à FDD 15)
@@ -51,6 +51,10 @@ máquina dedicada n3x-perf (amd64, Linux, cgroup v2, SMT desligado)
 - Lacuna do README fechada aqui: **L-31** (a fórmula de 45% e o dimensionamento de 1 vCPU e 256 MiB deixam de ser hipótese pelas regras S1 a S4 do contrato 7; os valores finais saem da primeira `prerelease` verde). Lacunas aplicadas: L-16 (admin só no socket), L-18 (canal de controle da drenagem), L-41 (longa duração fica na FDD 48, não aqui)
 - Pedidos atendidos: FDD 13 (p50 do hook até 0,05 ms), FDD 16 (entradas por requisição; adaptador mais cadeia vazia em 0,05/0,20 ms), FDD 17 (executor no Envoy real em 0,05/0,10 ms), FDD 26 (teto de conexões, parâmetros de HTTP/2, pressão de memória com 256 MiB), FDD 27 (`MemoryPercent`, `UnlimitedCPUCap` e `MinMemoryBytes`, entrypoint no orçamento ocioso, P-03), FDD 29 (duração da drenagem, `MinDrainWait`, custo ocioso com o health), FDD 47 (relatório para o `deploytool sizing import`; contingência de 384 MiB), FDD 48 (`combo.json`, `harness/` e aplicações), FDD 51 (mesmo runner e grupo, antes da 51, envelope `format: 1`, mesma política de ruído). Pedidos justificados como fora daqui (seção 3): longa duração e injeção de panic de ponta a ponta (FDDs 06 e 18, já fechados pela FDD 48), limite de body (FDD 15)
 - FDDs de que depende: 27 e 48 (diretas), 13, 16, 17, 18, 26, 28, 29 e 38 (sistema medido); relacionadas: 04 e 06 (memória e tarefas de fundo do exemplo), 46 (alertas e release), 47 (dimensionamento) e 51 (mesma máquina e sessão S35)
+
+**Clarificações (2026-10-22)**
+- Unidade da meta ociosa (ponto P-02): MiB, decidido na validação de consistência e aplicado ao PRD e ao ADR-009
+- Parcela do entrypoint no orçamento ocioso (I-01): incluída no ADR-009 e no HLD (até 20 MiB e 0,005 vCPU, hipótese); a meta dura continua no total do container, e as parcelas são rebalanceadas pela regra S5
 
 ---
 

@@ -72,6 +72,16 @@ Consumidores:
   - **L-51 aplicada:** bloco `runtime.plugin_limits` com as regras e os códigos da FDD 04
   - Pontos em aberto de FDDs anteriores fechados aqui: P-03 (parte do sidecar), P-04 e P-07 da FDD 02; P-02, P-03, P-07 e P-08 (parte do sidecar) da FDD 03; P-09 da FDD 04 (parte do sidecar); P-01 e P-05 da FDD 05 (a P-05 com a FDD 17)
 
+**Clarificações (2026-10-22)**
+- `app.address` fora do loopback é aviso ou erro? → Continua aviso (`app_not_loopback`, em `CheckDefaultMode`) e não impede a subida. Motivo: o sidecar não controla o endereço em que a aplicação escuta; uma aplicação em `0.0.0.0` fica alcançável mesmo com o sidecar apontando para `127.0.0.1`, então recusar daria uma falsa garantia. A regra "a aplicação nunca fica exposta" (PRD, segurança) é garantida pela topologia de implantação e pelo guia do operador, não por esta validação.
+- Refinos pedidos por FDDs posteriores (validação de consistência de 2026-10-22): o texto desta FDD continua valendo com os acréscimos e mudanças abaixo; em conflito, vale o contrato da FDD citada em cada item
+  - SID-05 (FDD 25), contratos 1 e 2: categoria nova `config.CategoryPreflight` com a sentinela `config.ErrPreflight` (saída 5, `N3X-S005`); precedência dos blocos `N3X-S002`, `N3X-S005`, `N3X-S004`, `N3X-S003`, com `preflight.ExitCode` no lugar de `config.ExitCode` no `cmd/n3x`; o `validate --so` faz as conferências do artefato (alvo, integridade e versão do `core/`); resumo JSON do `validate` com `target`, `so_core_version`, `image_version` e `integrity`; saídas 5 a 9 repartidas entre as SID-05 a SID-09
+  - SID-08 (FDD 28), contratos 2 e 4: `ENTRYPOINT ["/usr/local/bin/n3x"]` (caminho absoluto) com `CMD ["run"]`; textos de `key_read` e `file_read` com o UID e o GID do processo
+  - SID-09 (FDD 29), contrato 8: despacho do subcomando `probe [live|ready]`
+  - SID-10 (FDD 38), contrato 7: acessor `Config.ControllerCA()` com os bytes da CA já lidos pelo `Load`
+  - SID-11 (FDD 49), contratos 1 e 3: despacho da palavra `proxy` (modo Istio), repasse dos subcomandos do `pilot-agent` na imagem `istio-*`, subcomando `istio-drain`, `validate --mode istio|default` e `config.CheckIstioMode` com `Config.Present` (arquivo `istio.go`)
+- `n3x encrypt` com `--service` obrigatório (L-05) e `ENTRYPOINT` com `CMD` (I-03): registrados no ADR-003 e no HLD na validação de consistência de 2026-10-22
+
 ---
 
 ### 2. Objetivos técnicos
@@ -285,7 +295,7 @@ Parte 1: topo, `controller`, `keys`, `listener`, `app` e `resources`
 | `keys` | objeto | não; obrigatório se houver `ENC[...]` | ausente = nenhuma chave | | lido |
 | `keys.aes_file` | texto | sim, no bloco | | caminho absoluto; chave da FDD 03 (44 caracteres base64); permissão acima de `0440` só avisa | lido |
 | `listener.port` | inteiro | não | `17000` | 1 a 65535; no modo padrão, diferente de 17001, 17021, 17090 e da porta da aplicação | FDD 49 |
-| `app.address` | texto | sim no modo padrão | | IPv4 ou `[IPv6]` literal e porta (cluster `STATIC`); fora do loopback só avisa (hipótese) | FDD 49 |
+| `app.address` | texto | sim no modo padrão | | IPv4 ou `[IPv6]` literal e porta (cluster `STATIC`); fora do loopback só avisa (`app_not_loopback`, decidido na clarificação de 2026-10-22) | FDD 49 |
 | `app.protocol` | texto | não | `http1` | `http1`, `http2` ou `grpc` | FDD 49 |
 | `app.timeouts.connect` | duração | não | `1s` | 10ms a 60s | FDD 49 |
 | `app.timeouts.request` | duração | não | `15s` | 10ms a 1h | FDD 49 |

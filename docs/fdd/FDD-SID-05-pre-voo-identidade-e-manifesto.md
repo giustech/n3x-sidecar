@@ -67,6 +67,13 @@ Quem consome:
   - **D-12 completada:** o `n3x validate --so` deixa de ser stub e faz o mesmo pré-voo do `run` (contrato 1)
 - Pedidos atendidos: FDD 15 (ligar o leitor ao `run`, preencher `CoreVersion`, decidir os códigos de saída 5 a 9), FDD 16 (código de saída 5 citado pela FDD 26; identidade e alvo em métrica, seção 7), FDD 09 (identidade e manifesto para a visão `Sidecar`), FDD 17 (`SidecarParts.Identity`), FDD 21 (conferir a `arch` do manifesto contra a do processo), FDD 22 (contrato de leitura com `ReadFile` e `WithIntegrity`, `Image` inteiro, P-01, P-02, eventos `manifest_loaded` e `manifest_rejected`, busca na CI por `config.DefaultSO` usado como reserva), FDD 26 (código de saída 5; versão do `core/` do `.so` para evoluir a config do filtro)
 
+**Clarificações (2026-10-22)**
+- Refinos pedidos por FDDs posteriores (validação de consistência de 2026-10-22): o texto desta FDD continua valendo com os acréscimos e mudanças abaixo; em conflito, vale o contrato da FDD citada em cada item
+  - SID-07 (FDD 27), contrato 9: campo opcional `Facts.GoRuntime` (`go_runtime`, `format` continua 1), gravado pelo supervisor; no `.so`, `SelfPreflight.Source` chama `goruntime.Verify` e loga `go_runtime_mismatch` sem recusar a config do filtro
+  - SID-08 (FDD 28), seção 4: o texto de `image_target` traz a dica de montar o `n3x.yaml` como arquivo (`subPath`) quando um diretório montado em `/etc/n3x` esconde o `/etc/n3x/target`
+  - SID-11 (FDD 49), contratos 1, 2 e 5: modo novo `preflight.ModeIstio` (com `pilot-agent version --short`, `config.CheckIstioMode` e sem conferência de `major.minor` do Envoy), campo opcional `Facts.Istio`, regra `target_mode` (saída 5) para `run` com alvo `istio-*` e as regras `istio_*` no `N3X-S005`
+- Leitura das variáveis injetadas pelo orquestrador (L-72): o reflexo pedido no FR-001 do PRD (L-33) foi aplicado na validação de consistência
+
 ---
 
 ### 2. Objetivos técnicos

@@ -35,6 +35,19 @@ Dependências com outros sistemas
 - Orquestradores: Kubernetes 1.29 ou superior (sidecar nativo, ADR-007 do `n3x-sdk`), ECS e docker compose
 - Istio 1.31, apenas como compatibilidade (ADR-006 do `n3x-sdk`)
 
+**Clarificações (2026-10-22)**
+Alinhamentos aprovados na validação de consistência com o PRD e as FDDs SID-01 a SID-12 (o texto das seções abaixo já reflete cada um):
+- Admin do Envoy em socket Unix `/tmp/n3x/admin.sock`, sem porta TCP; a `17001` fica reservada e sem uso (SID-06)
+- Config do filtro só com `config_path` e com `do_not_close: true` (SID-01 e SID-06; nota de revisão no ADR-007)
+- Imagem com `ENTRYPOINT ["/usr/local/bin/n3x"]` e `CMD ["run"]`; subcomandos `probe`, `help`, `istio-drain` e a palavra `proxy` do modo Istio (SID-01, SID-08, SID-09 e SID-11; nota de revisão no ADR-003)
+- Drenagem: os 2 s dos plugins começam antes do SIGTERM ao Envoy, pelo canal de controle; total máximo de `runtime.drain_timeout` mais 9 s (SID-09; nota de revisão no ADR-006)
+- Prazo de requisição gRPC pelo `grpc-timeout` do cliente, até 1 h; teto das chamadas ao controller configurável em `controller.timeouts.call` (SID-06 e SID-10; nota de revisão no ADR-006)
+- Até 5 entradas do Envoy no Go com trabalho da cadeia por requisição (SID-02; nota de revisão no ADR-009)
+- `OnComplete` para toda instância do recorte; saída do entrypoint com o código do Envoy quando ele morre em serviço (SID-03 e SID-07)
+- Orçamento ocioso em MiB e com a parcela do entrypoint (SID-07, SID-09 e SID-12; nota de revisão no ADR-009)
+- Campos `runtime.request_body` e `runtime.plugin_limits` no schema e métricas novas, com o catálogo completo na SID-02 (SID-01, SID-02 e SID-04)
+- Decisões pendentes resolvidas pelas FDDs, marcadas na lista do fim deste documento
+
 ---
 
 ### Arquitetura geral
@@ -75,7 +88,7 @@ n3x-sidecar/
                      │        └─ libn3x.so (runtime Go único)   │ ──► controller :17443
                      │             core + plugin core + plugins │     (gRPC, TLS 1.3)
   Prometheus ──► :17090  listener → admin /stats/prometheus    │
-                     │        admin 127.0.0.1:17001             │
+                     │        admin /tmp/n3x/admin.sock         │
                      └──────────────────┬───────────────────────┘
                                         ▼ 127.0.0.1:<porta>
                                     aplicação
@@ -93,19 +106,21 @@ n3x-sidecar/
 9. Inicia o Envoy como processo filho, com as variáveis do runtime Go, e passa a repassar sinais
 10. Abre o `17021`; `/ready` só responde 200 quando o Envoy está pronto e a aplicação passa no health check (prazo de 30 s para o Envoy ficar pronto, senão encerra)
 
-Qualquer falha nos passos 1 a 8 encerra o container com código diferente de zero e mensagem que aponta o campo, sem segredos. Se o Envoy morre fora da drenagem, o entrypoint sai com o mesmo código; quem reinicia é o orquestrador.
+Qualquer falha nos passos 1 a 8 encerra o container com código diferente de zero e mensagem que aponta o campo, sem segredos. Se o Envoy morre fora da drenagem, o entrypoint sai com o código do Envoy (128 mais o número do sinal, se morto por sinal; 0 vira 1, para o orquestrador tratar como falha; SID-07); quem reinicia é o orquestrador.
 
-**Drenagem no SIGTERM** (FR-003)
+**Drenagem no SIGTERM** (FR-003; detalhada na SID-09)
 1. `/ready` passa a responder 503 na hora
-2. O entrypoint avisa o `.so` pelo canal de controle local (hipótese: socket Unix `/tmp/n3x/control.sock`, modo 0600), e o plugin core envia o evento de início da drenagem
-3. `POST /drain_listeners?graceful` no admin: o Envoy fecha as conexões aos poucos (`GOAWAY` em HTTP/2 e `Connection: close` em HTTP/1.1)
-4. Espera as conexões ativas chegarem a zero ou `runtime.drain_timeout` (padrão de 20 s)
-5. Manda SIGTERM ao Envoy; os plugins têm 2 s para encerrar e o plugin core avisa a saída ao controller
-6. Sem saída em 5 s, SIGKILL
+2. O entrypoint avisa o `.so` pelo canal de controle local (socket Unix `/tmp/n3x/control.sock`, modo 0600, servido pelo `.so`), e o plugin core envia o evento de início da drenagem
+3. `POST /drain_listeners?graceful&inboundonly` no admin, com o Envoy iniciado com `--drain-strategy immediate`: o Envoy pede o fechamento das conexões (`GOAWAY` em HTTP/2 e `Connection: close` em HTTP/1.1), e o listener de métricas `17090` continua servindo
+4. Espera as conexões ativas chegarem a zero, depois de uma espera mínima de 3 s, ou `runtime.drain_timeout` (padrão de 20 s)
+5. Pede ao `.so`, pelo canal de controle, o fim dos plugins: as tarefas de fundo têm 2 s para encerrar e o plugin core avisa a saída ao controller com o Envoy ainda vivo; o SIGTERM ao Envoy só sai depois da confirmação ou em 3 s
+6. Manda SIGTERM ao Envoy; sem saída em 5 s, SIGKILL
+
+Prazo total máximo do sinal à saída: `runtime.drain_timeout` mais 9 s (29 s com o padrão). A aplicação pode antecipar os passos 1 a 4 com o gatilho opcional `POST http://127.0.0.1:17021/drain`, aceito só de loopback (SID-09).
 
 **Modo Istio** (ADR-006 do `n3x-sdk`: o Istio manda)
 - A imagem `ghcr.io/giustech/n3x/sidecar:<semver>-istio-1.31` é baseada no `proxyv2` e substitui a imagem injetada (anotação `sidecar.istio.io/proxyImage`)
-- Quando o binário `n3x` recebe os argumentos do injetor (`proxy sidecar ...`), ele entra no modo Istio: lê e valida o mesmo `n3x.yaml`, calcula `GOMAXPROCS`, `GOMEMLIMIT` e `GODEBUG` e faz `exec` do `pilot-agent` com os mesmos argumentos (hipótese: detecção pelo primeiro argumento)
+- Quando o binário `n3x` recebe os argumentos do injetor (`proxy sidecar ...`), ele entra no modo Istio: lê e valida o mesmo `n3x.yaml`, calcula `GOMAXPROCS`, `GOMEMLIMIT` e `GODEBUG` e faz `exec` do `pilot-agent` com os mesmos argumentos (detecção pelo primeiro argumento `proxy`, com os demais subcomandos do `pilot-agent` repassados direto; SID-11)
 - Bootstrap, portas, health (`15021`) e drenagem são do Istio; o N3X não abre `17000`, `17021` nem `17090`. As seções `listener` e `app` do `n3x.yaml` são ignoradas, com aviso no log
 - O `EnvoyFilter` estático insere o filtro do N3X antes do router nos listeners de entrada, apontando para o `n3x.yaml` montado no pod
 - `GOMAXPROCS` precisa ser maior ou igual ao `concurrency` do proxy definido no Istio; o entrypoint lê o valor, recusa subir se o `GOMAXPROCS` calculado ficar abaixo dele e registra os valores efetivos no log
@@ -115,7 +130,7 @@ Qualquer falha nos passos 1 a 8 encerra o container com código diferente de zer
 Ambiente de implantação
 - Agnóstico: cloud ou on-premises, onde houver containers (topologias de referência em `n3x-sdk/deploy/`, ADR-008 do `n3x-sdk`)
 - Kubernetes 1.29 ou superior: sidecar nativo (`initContainers` com `restartPolicy: Always`), probes em `17021/live` e `17021/ready`, `n3x.yaml` por ConfigMap e chave AES por Secret montado como arquivo
-- ECS: sidecar e aplicação na mesma task (`awsvpc`), aplicação com `dependsOn` do sidecar, health check do container por comando (ver decisões pendentes)
+- ECS: sidecar e aplicação na mesma task (`awsvpc`), aplicação com `dependsOn` do sidecar, health check do container por comando (`n3x probe live`, SID-09)
 - docker compose: aplicação com `network_mode: "service:<sidecar>"`, escutando em `127.0.0.1`
 - Istio: imagem `istio-1.31` no lugar do `proxyv2` injetado, `n3x.yaml` e chave montados no container do proxy (hipótese: anotação `sidecar.istio.io/userVolumeMount`)
 
@@ -143,8 +158,8 @@ Padrões adotados
 ### Componentes e responsabilidades
 | Componente | Responsabilidades | Dependências |
 | ----------- | ----------------- | ------------ |
-| Entrypoint `n3x` (`cmd/n3x`) | Subcomandos `run`, `validate`, `encrypt` e `keygen` (ADR-003); detecção do modo Istio; exit codes e mensagens sem segredos | `core/config`, `secret` do SDK, `core/identity` |
-| Supervisor (`internal/supervisor`) | Cálculo do runtime Go e do `--concurrency`; inicia e supervisiona o Envoy; repassa sinais; conduz a drenagem; avisa o `.so` pelo canal de controle local | Envoy, admin `127.0.0.1:17001` |
+| Entrypoint `n3x` (`cmd/n3x`) | Subcomandos `run`, `validate`, `encrypt`, `keygen`, `probe`, `help` e, na imagem `istio-*`, `istio-drain` (ADR-003 e nota de revisão); detecção do modo Istio pela palavra `proxy`; exit codes e mensagens sem segredos | `core/config`, `secret` do SDK, `core/identity` |
+| Supervisor (`internal/supervisor`) | Cálculo do runtime Go e do `--concurrency`; inicia e supervisiona o Envoy; repassa sinais; conduz a drenagem; avisa o `.so` pelo canal de controle local | Envoy, admin em `/tmp/n3x/admin.sock` |
 | Gerador de bootstrap (`internal/bootstrap`) | Gera o bootstrap sem segredos (listener, cluster, normalização, limites, overload manager, filtro único, listener de métricas e admin local); valida com `envoy --mode validate` | `core/config` |
 | Health (`internal/health`) | Serve `17021` (`/live` e `/ready`); executa o health check da aplicação (`http`, `grpc` ou `tcp`); vira "não pronto" na drenagem (ADR-002) | Admin do Envoy (`/ready`), aplicação |
 | Config (`core/config`) | Schema v1 do `n3x.yaml`; validação contra o schema de cada plugin do manifesto; regra de grupos paralelos; mesma validação no entrypoint e no `.so` | Manifesto embutido no `.so` |
@@ -176,8 +191,8 @@ Quem persiste dados: ninguém no sidecar; o estado é todo volátil. Quem faz ca
 - Body: só cruza para o Go se alguma instância do recorte declarou hook de body
 - O Envoy encaminha para `127.0.0.1:<porta>` mantendo o protocolo, com prazo de conexão de 1 s e de requisição de 15 s. Aplicação fora do ar: 503 ou `UNAVAILABLE`; prazo estourado: 504 ou `DEADLINE_EXCEEDED`
 - Na resposta, os grupos rodam em ordem inversa, com as mesmas regras
-- No fim da requisição (`on_stream_complete`), todas as instâncias que rodaram são notificadas, inclusive quando houve negação. Se o cliente desconectou com trabalho pendente, o `ctx` é cancelado, a requisição é marcada como encerrada e o resultado é descartado sem retomar
-- Meta: no máximo 5 cruzamentos Envoy→Go por requisição, independentemente do número de plugins
+- No fim da requisição (`on_stream_complete`), todas as instâncias do recorte que implementam o hook são notificadas, inclusive as de fases não alcançadas e quando houve negação; só a instância com o disjuntor aberto não recebe (SID-03). Se o cliente desconectou com trabalho pendente, o `ctx` é cancelado, a requisição é marcada como encerrada e o resultado é descartado sem retomar
+- Meta: no máximo 5 cruzamentos Envoy→Go com trabalho da cadeia por requisição, independentemente do número de plugins; as demais entradas do ABI (criação, destruição, pedaços de body e trailers) são passagens O(1) e sem alocação (SID-02)
 
 **Tratamento de falhas por instância** (FR-004)
 | Situação | fail-closed | fail-open |
@@ -195,14 +210,14 @@ Toda falha incrementa `n3x_plugin_failures_total` com o `reason`; panics também
 | --- | --- | --- | --- |
 | Trabalho assíncrono de plugin | 200 ms | `plugins[].async.timeout` | Política da instância |
 | Conexão com a aplicação | 1 s | `app.timeouts.connect` | 503 / `UNAVAILABLE` |
-| Requisição à aplicação | 15 s | `app.timeouts.request` | 504 / `DEADLINE_EXCEEDED` |
-| Chamada unária de plugin ao controller | 5 s (teto, mesmo com `ctx` maior) | `controller.timeouts.call` | Erro devolvido ao plugin |
+| Requisição à aplicação | 15 s; em gRPC, o `grpc-timeout` do cliente, até 1 h, e sem ele `app.timeouts.request` (SID-06) | `app.timeouts.request` | 504 / `DEADLINE_EXCEEDED` |
+| Chamada unária de plugin ao controller | 5 s (teto configurável de 100 ms a 60 s, mesmo com `ctx` maior; o login usa `controller.timeouts.login`; SID-10) | `controller.timeouts.call` | Erro devolvido ao plugin |
 | Login no controller | 10 s | `controller.timeouts.login` | Novo login com backoff |
 | Health check da aplicação | 1 s, a cada 5 s | `app.health.timeout` e `interval` | Sidecar não pronto |
 | `envoy --mode validate` | 10 s | fixo | Container encerra |
 | Envoy pronto após subir | 30 s | fixo | Container encerra |
 | Drenagem | 20 s | `runtime.drain_timeout` | SIGTERM ao Envoy |
-| Encerramento dos plugins | 2 s | fixo | Encerra mesmo assim |
+| Encerramento dos plugins (antes do SIGTERM ao Envoy, SID-09) | 2 s | fixo | Encerra mesmo assim; o SIGTERM ao Envoy sai em até 3 s |
 | SIGKILL após SIGTERM ao Envoy | 5 s | fixo | SIGKILL |
 
 O SDK só entrega `ctx` com prazo aos plugins, e o `n3x-plugin build` recusa `context.Background()` e `context.TODO()` em código de plugin.
@@ -275,6 +290,8 @@ runtime:
   drain_timeout: 20s
   log_level: info                    # debug | info | warn | error
   panic_breaker: { panics: 5, window: 60s, zombies: 100 }
+  request_body: { max_bytes: 1Mi }   # limite do body para hooks de body (SID-01)
+  plugin_limits: {}                  # cotas por plugin: memória, tarefas e conexões (SID-01)
 
 plugins:                             # o plugin core é implícito e não se declara
   - id: n3x.example
@@ -303,7 +320,7 @@ Regras de validação (no `n3x validate`, no `n3x run` e no `.so`)
 
 **Formato `ENC[...]`**
 - `ENC[v1:<base64(nonce de 12 bytes || texto cifrado || tag)>]`, com AES-256-GCM
-- Dado associado (AAD) igual a `n3x:v1:<service>`, para que o valor cifrado de um serviço não funcione copiado no `n3x.yaml` de outro (hipótese)
+- Dado associado (AAD) igual a `n3x:v1:<service>`, para que o valor cifrado de um serviço não funcione copiado no `n3x.yaml` de outro; por isso o `n3x encrypt` exige `--service` (SID-01)
 - Chave: 32 bytes aleatórios em base64, gerados por `n3x keygen`
 
 Relações
@@ -328,20 +345,20 @@ Versionamento e retenção
 | Nome | Tipo | Protocolo | Exposição | SLAs/Limites |
 | ---- | ---- | ---------- | --------- | ------------- |
 | Entrada (`17000`) | API | HTTP/1.1, HTTP/2 (h2c) e gRPC | Externa | Latência adicionada p50 ≤ 0,5 ms e p99 ≤ 2 ms a 1.000 rps; headers até 60 KiB e 100 itens |
-| Health (`17021`, `/live` e `/ready`) | API | HTTP, servido pelo entrypoint | Interna (orquestrador) | Pronto em até 5 s após o container subir; 503 imediato na drenagem |
+| Health (`17021`, `/live`, `/ready` e `POST /drain` só de loopback) | API | HTTP, servido pelo entrypoint | Interna (orquestrador; `/drain` só para a aplicação do pod) | Pronto em até 5 s após o container subir; 503 imediato na drenagem |
 | Métricas (`17090`, `GET /metrics`) | API | HTTP (Prometheus), listener do Envoy → `/stats/prometheus` | Interna | Só esse caminho e método; nenhum outro endpoint do admin |
-| Admin do Envoy (`127.0.0.1:17001`) | API | HTTP | Só localhost | Usado só pelo supervisor e pelo listener de métricas (ver riscos) |
-| CLI `n3x run`, `validate`, `encrypt` e `keygen` | SDK | Processo e stdin/stdout | Operador e CI | `validate` não sobe o Envoy; `encrypt` lê o segredo do stdin |
+| Admin do Envoy (`unix:/tmp/n3x/admin.sock`, modo 0600) | API | HTTP sobre socket Unix | Só o container do sidecar, sem porta TCP | Usado só pelo supervisor, pelo health e pelo listener de métricas; a porta 17001 fica reservada e sem uso (SID-06) |
+| CLI `n3x run`, `validate`, `encrypt`, `keygen`, `probe` e `help` (mais `istio-drain` na imagem `istio-*`) | SDK | Processo e stdin/stdout | Operador, CI e health check do orquestrador | `validate` não sobe o Envoy; `encrypt --key --service` lê o segredo do stdin; `probe` consulta a `17021` |
 | `n3x.yaml` v1 + chave AES + CA | SDK | Arquivos YAML e binários montados | Orquestrador → container | Lidos só na subida |
-| Config do filtro (`config_path` e `key_path`) | API | JSON no bootstrap ou no `EnvoyFilter` | Interna (entrypoint ou Istio → `.so`) | Nunca contém segredos |
+| Config do filtro (`config_path`) | API | JSON no bootstrap ou no `EnvoyFilter` | Interna (entrypoint ou Istio → `.so`) | Nunca contém segredos; o caminho da chave vem de `keys.aes_file` do `n3x.yaml` |
 | `EnvoyFilter` estático | API | CRD do Istio | Malha | Restrito a `proxyVersion` 1.31 |
-| Canal de controle local (`/tmp/n3x/control.sock`) | API | Socket Unix | Só processo do sidecar | Hipótese; modo 0600 |
+| Canal de controle local (`/tmp/n3x/control.sock`) | API | Socket Unix, JSON de uma linha (`ping`, `drain`, `stop`) | Só o entrypoint, conferido por `SO_PEERCRED` | Modo 0600; servido pelo `.so` (SID-09) |
 | Conexão compartilhada | API | gRPC com TLS 1.3 até `17443` | Interna (`.so` → controller) | Uma conexão por processo; prazo de até 5 s por chamada; buffer de 1.000 itens |
 
 **Bootstrap gerado (essencial)**
 ```yaml
 admin:
-  address: { socket_address: { address: 127.0.0.1, port_value: 17001 } }
+  address: { pipe: { path: /tmp/n3x/admin.sock, mode: 384 } }   # 0600, sem porta TCP (SID-06)
 overload_manager:
   resource_monitors:
   - name: envoy.resource_monitors.cgroup_memory
@@ -358,24 +375,24 @@ static_resources:
     # max_request_headers_kb 60, headers_with_underscores_action REJECT_REQUEST,
     # request_headers_timeout 10s, generate_request_id true
     # http_filters: [n3x (dynamic module), envoy.filters.http.router]
-    # route "/" → cluster app, timeout = app.timeouts.request
+    # rotas grpc (grpc-timeout do cliente até 1 h, senão app.timeouts.request) e http (timeout = app.timeouts.request) → cluster app (SID-06)
   - name: n3x_metrics                          # 0.0.0.0:17090
     # route exata GET /metrics → cluster admin, prefix_rewrite /stats/prometheus
   clusters:
   - name: app                                  # STATIC 127.0.0.1:<porta>, connect_timeout 1s
-    # http2_protocol_options quando app.protocol é http2 ou grpc
-  - name: admin                                # STATIC 127.0.0.1:17001
+    # protocolo por typed_extension_protocol_options (HttpProtocolOptions): HTTP/2 quando app.protocol é http2 ou grpc (SID-06)
+  - name: admin                                # STATIC pipe /tmp/n3x/admin.sock
 ```
 Filtro do N3X no bootstrap e no `EnvoyFilter`:
 ```yaml
 name: n3x
 typed_config:
   "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
-  dynamic_module_config: { name: n3x }       # /usr/lib/n3x/libn3x.so pelo search path
+  dynamic_module_config: { name: n3x, do_not_close: true }   # /usr/lib/n3x/libn3x.so pelo search path; o runtime Go não é descarregado
   filter_name: n3x
   filter_config:
     "@type": type.googleapis.com/google.protobuf.StringValue
-    value: '{"config_path":"/etc/n3x/n3x.yaml","key_path":"/run/n3x/aes.key"}'
+    value: '{"config_path":"/etc/n3x/n3x.yaml"}'   # sem key_path: a chave vem de keys.aes_file (SID-06)
 ```
 Logs do Envoy em JSON por `application_log_config.log_format.json_format`. O search path de dynamic modules é fixado na imagem em `/usr/lib/n3x`. O bootstrap gerado é comparado com arquivos golden nos testes.
 
@@ -383,7 +400,7 @@ Logs do Envoy em JSON por `application_log_config.log_format.json_format`. O sea
 ```yaml
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
-metadata: { name: n3x, namespace: istio-system }
+metadata: { name: n3x-istio-1-31, namespace: istio-system }   # um objeto por alvo (SID-11)
 spec:
   workloadSelector: { labels: { n3x.io/enabled: "true" } }
   configPatches:
@@ -400,11 +417,11 @@ spec:
       operation: INSERT_BEFORE
       value: { }   # mesmo bloco "Filtro do N3X" acima
 ```
-Igual para toda a malha; o que muda por serviço é só o `n3x.yaml` montado. A normalização de path no modo Istio depende da `meshConfig.pathNormalization` (hipótese: exigir `MERGE_SLASHES` ou mais restrita na documentação).
+Igual para toda a malha; o que muda por serviço é só o `n3x.yaml` montado. A normalização de path no modo Istio depende da `meshConfig.pathNormalization` (recomendado `DECODE_AND_MERGE_SLASHES`, mínimo `MERGE_SLASHES`; o `.so` recusa com 400 o path que chegar fora da forma normalizada; SID-11).
 
 **Imagens de runtime**
 - `ghcr.io/giustech/n3x/sidecar:<semver>-envoy-1.40` a partir de `envoyproxy/envoy:v1.40.x@sha256:...`; `ghcr.io/giustech/n3x/sidecar:<semver>-istio-1.31` a partir de `istio/proxyv2:1.31.x@sha256:...`; amd64 e arm64, formato OCI, com semver próprio (ADR-001 do `n3x-builder`)
-- Conteúdo: `/usr/local/bin/n3x`, `/etc/n3x/target`, diretório `/usr/lib/n3x/` vazio para o `.so` copiado no estágio final do Dockerfile do operador, `ENTRYPOINT ["n3x", "run"]`
+- Conteúdo: `/usr/local/bin/n3x`, `/etc/n3x/target`, diretório `/usr/lib/n3x/` vazio para o `.so` copiado no estágio final do Dockerfile do operador, `ENTRYPOINT ["/usr/local/bin/n3x"]` com `CMD ["run"]` (para `docker run <imagem> encrypt ...` e o despacho do modo Istio funcionarem; SID-08)
 - A imagem não traz `.so` padrão; ele sempre sai do `n3x-plugin build` (ADR-001)
 
 ---
@@ -435,15 +452,17 @@ Técnicas aplicadas
 | Parcela | p50 | p99 |
 | --- | --- | --- |
 | Envoy puro (proxy sem o filtro N3X) | 0,30 ms | 1,00 ms |
-| Core do `.so` (adaptador + executor, até 5 cruzamentos) | 0,15 ms | 0,50 ms |
+| Core do `.so` (adaptador + executor, até 5 cruzamentos com trabalho da cadeia) | 0,15 ms | 0,50 ms |
 | Plugins síncronos (core + exemplo) | 0,05 ms | 0,10 ms |
 | Folga | | 0,40 ms |
 | **Total (meta do PRD)** | **≤ 0,5 ms** | **≤ 2 ms** |
 
-| Recurso ocioso | Envoy | Runtime Go + core | Plugins | Total (meta) |
-| --- | --- | --- | --- | --- |
-| Memória | 45 MB | 35 MB | 20 MB | ≤ 100 MB |
-| CPU | 0,02 vCPU | 0,02 vCPU | 0,01 vCPU | ≤ 0,05 vCPU |
+| Recurso ocioso | Envoy | Runtime Go + core | Plugins | Entrypoint (supervisor e health) | Total (meta) |
+| --- | --- | --- | --- | --- | --- |
+| Memória | 45 MiB | 35 MiB | 20 MiB | 20 MiB (hipótese) | ≤ 100 MiB |
+| CPU | 0,02 vCPU | 0,02 vCPU | 0,01 vCPU | 0,005 vCPU (hipótese) | ≤ 0,05 vCPU |
+
+As parcelas somam mais que a meta (120 MiB e 0,055 vCPU): a meta dura é o total do container, e as parcelas são rebalanceadas pelo benchmark (regra S5 da SID-12) antes da v1.
 
 - 0 alocações por requisição no executor, nos recortes e na negação (`-benchmem` como portão da CI)
 - Dimensionamento recomendado: 1 vCPU e 256 MiB para até 1.000 rps (hipótese, confirmada pelo benchmark)
@@ -483,7 +502,7 @@ Proteção de dados
 
 Gestão de segredos
 - `ENC[v1:...]` com AES-256-GCM e AAD ligado ao serviço; chave de 32 bytes em arquivo montado, nunca em variável de ambiente
-- `n3x keygen` gera a chave e `n3x encrypt --key <arquivo>` cifra o segredo lido do stdin (resolve a pendência do HLD de plataforma)
+- `n3x keygen` gera a chave e `n3x encrypt --key <arquivo> --service <serviço>` cifra o segredo lido do stdin (resolve a pendência do HLD de plataforma)
 - Rotação da chave AES: gerar chave nova, recifrar os valores e redeployar; a v1 não aceita duas chaves ao mesmo tempo
 
 ---
@@ -506,15 +525,16 @@ Métricas (stats do Envoy definidas pelo `.so`, expostas em `17090` ou pelo merg
 | `n3x_controller_buffer_dropped_total` | counter | |
 | `n3x_plugin_panics_total` | counter | `plugin`, `instance` |
 | `n3x_plugin_breaker_open` | gauge 0/1 | `plugin`, `instance` |
-| `n3x_plugin_failures_total` | counter | `plugin`, `instance`, `reason` (`timeout`, `error`, `panic` ou `overflow`) |
+| `n3x_plugin_failures_total` | counter | `plugin`, `instance`, `reason` (`timeout`, `error`, `panic`, `overflow`, `body_limit` ou `breaker`) |
 | `n3x_plugin_denies_total` | counter | `plugin`, `instance`, `code` |
 | `n3x_plugin_async_inflight` | gauge | `plugin`, `instance` |
 | `n3x_plugin_async_zombies` | gauge | `plugin`, `instance` |
-| `n3x_plugin_duration_seconds` | histogram | `plugin`, `instance`, `phase` |
+| `n3x_plugin_duration_seconds` | histogram (só `_bucket` e `_count` no sidecar) | `plugin`, `instance`, `phase`, `hook` |
 | `n3x_plugin_memory_bytes` | gauge | `plugin` |
 | `n3x_build_info` | gauge = 1 | `version`, `target`, `config_hash` |
 
 - Nenhum rótulo com path, header ou valor vindo do usuário
+- Catálogo completo, com as famílias `n3x_sidecar_*`, `n3x_config_secrets_in_clear` e as de memória, tarefas e conexões por plugin: SID-02, contrato 9 (e os acréscimos pedidos pelas SID-04, SID-05, SID-07, SID-08, SID-10, SID-11 e SID-12)
 - As stats padrão do Envoy (upstream, conexões e overload) continuam disponíveis em `/metrics`
 - A observabilidade do tráfego da aplicação continua fora da v1; `n3x_plugin_duration_seconds` mede o custo do N3X
 
@@ -583,7 +603,7 @@ Dashboards e alertas
 - **Impacto:** p99 acima de 2 ms
 - **Mitigação:**
   - Benchmark open-loop contra o Envoy puro como portão noturno
-  - 0 alocações no caminho comum e até 5 cruzamentos por requisição
+  - 0 alocações no caminho comum e até 5 cruzamentos com trabalho da cadeia por requisição
   - Body só cruza para o Go quando alguma instância pede
 - **Plano de contingência:** otimizar os caminhos quentes ou rever o orçamento com base nas medições antes de fechar a v1
 
@@ -622,13 +642,14 @@ Dashboards e alertas
   - O `.so` loga os valores de runtime que realmente recebeu
 - **Plano de contingência:** fixar o patch suportado no catálogo e, naquele serviço, rodar o sidecar do N3X sem Istio
 
-#### Aplicação alcança o admin do Envoy em `127.0.0.1:17001`
-- **Probabilidade:** média
-- **Impacto:** como a aplicação divide o namespace de rede com o sidecar, um processo comprometido nela pode chamar `/quitquitquit`, `/drain_listeners` ou `/config_dump`
+#### Aplicação alcança o admin do Envoy
+- **Probabilidade:** baixa (era média com o admin em `127.0.0.1:17001`)
+- **Impacto:** como a aplicação divide o namespace de rede com o sidecar, um processo comprometido nela poderia chamar `/quitquitquit`, `/drain_listeners` ou `/config_dump`
 - **Mitigação:**
+  - Admin só no socket Unix `/tmp/n3x/admin.sock` (0600) dentro de `/tmp/n3x` (0700), sem porta TCP (decidido em 2026-10-22; SID-06)
   - Nenhum segredo no `/config_dump` (ADR-007)
-  - Proposta pendente: admin em socket Unix dentro do sistema de arquivos do sidecar (modo 0600), que a aplicação não enxerga
-- **Plano de contingência:** manter a aplicação sem acesso ao localhost do sidecar onde o orquestrador permitir, até a decisão
+  - Guia: o `/tmp` do sidecar nunca é volume compartilhado com a aplicação
+- **Plano de contingência:** se um orquestrador exigir `/tmp` compartilhado, mover o socket para um diretório próprio numa minor
 
 #### Grupo paralelo com resultado diferente entre execuções
 - **Probabilidade:** baixa
@@ -655,16 +676,16 @@ ADRs associados
 - Herdados do `n3x-sdk`: ADR-003 (login e sessão HMAC), ADR-004 (capacidades do plugin core), ADR-005 (memória isolada), ADR-006 (portas 17xxx e Istio no comando), ADR-007 (sidecar nativo no Kubernetes), ADR-009 (sem tracing) e ADR-010 (metas no nível do sistema)
 
 Decisões pendentes
-- Admin do Envoy em socket Unix em vez de `127.0.0.1:17001`, para a aplicação não alcançá-lo: exige rever o ADR-006 do `n3x-sdk` e o PRD; decidir antes do primeiro release
-- Comando de health dentro do container para ECS e docker compose, que não usam probe HTTP e cuja imagem do Envoy não traz `curl` (hipótese: subcomando `n3x probe`, que consulta `127.0.0.1:17021/ready`)
-- Canal de controle local entre o entrypoint e o `.so` para o evento de início da drenagem (hipótese: socket Unix); no modo Istio, a forma de detectar o início da drenagem
-- Detecção do modo Istio pelo primeiro argumento (`proxy`) ou por subcomando explícito
+- Resolvida em 2026-10-22: admin do Envoy em socket Unix (`/tmp/n3x/admin.sock`), sem porta TCP (SID-06; PRD atualizado). Pendência externa: refletir no ADR-006 do `n3x-sdk`
+- Resolvida: comando de health dentro do container para ECS e docker compose, com o subcomando `n3x probe live|ready` (SID-09)
+- Resolvida: canal de controle local pelo socket Unix `/tmp/n3x/control.sock`, servido pelo `.so` (SID-09); no modo Istio, a drenagem é detectada pelo admin do Envoy, com o preStop `n3x istio-drain` como contingência (SID-11)
+- Resolvida: detecção do modo Istio pelo primeiro argumento `proxy`, com repasse dos demais subcomandos do `pilot-agent` (SID-11)
 - Regras da análise estática de `ctx` e de bloqueio: implementação no HLD do `n3x-builder`
 - `sdk.Sleep`, clientes com prazo, `AssertHonorsCancel` e cota padrão de memória por plugin: HLD do `n3x-sdk`
 - Resolvida: formato da config efetiva, mascaramento e hash (ADR-006 do `n3x-plugin-core`)
 - Pseudo-versão do SDK Go do Envoy e patch exato do Istio suportado: catálogo do `n3x-builder`
-- Ajuste das fórmulas de `GOMEMLIMIT` e do orçamento após o primeiro benchmark: este HLD
-- Atualização do PRD: FR-001 (credencial como `service` do topo + `controller.secret`) e FR-004 (grupo paralelo por `order` e disjuntor também por zumbis)
+- Ajuste das fórmulas de `GOMEMLIMIT` e do orçamento após o primeiro benchmark: SID-12 (regras S1 a S7)
+- Resolvida em 2026-10-22: atualização do PRD no FR-001 (credencial como `service` do topo + `controller.secret`) e no FR-004 (grupo paralelo por `order` e disjuntor por instância, também por zumbis)
 
 Próximos passos
 - Implementar `core/config` com o schema v1 e testes de tabela e fuzzing, base para o `n3x validate`

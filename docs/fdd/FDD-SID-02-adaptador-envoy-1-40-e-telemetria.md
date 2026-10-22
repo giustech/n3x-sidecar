@@ -80,6 +80,19 @@ Consumidores:
   - FDD 19: capacidades do `envoy-1.40` confirmadas; log `adapter_loaded` com as capacidades para o teste da matriz (P-06 da FDD 19)
   - FDD 26: config do filtro lida com `envoycfg.ParseFilterConfig`; marcador `N3X_ENVOY_VALIDATE` respeitado; body acumulado até o limite com o buffer do listener em `max(1 MiB, max_bytes)`; nome das stats `n3x_` no `/stats/prometheus` (P-01 da FDD 26); logs do Envoy não configurados aqui
 
+**Clarificações (2026-10-22)**
+- Refinos pedidos por FDDs posteriores (validação de consistência de 2026-10-22): o texto desta FDD continua valendo com os acréscimos e mudanças abaixo; em conflito, vale o contrato da FDD citada em cada item
+  - SID-04 (FDD 18), contrato 1: valor novo `telemetry.ReasonBreaker` (`reason="breaker"`) em `n3x_plugin_failures_total`
+  - SID-05 (FDD 25), seção 7: handle `Platform.SetIdentityInfo(source, facts)` e gauge `n3x_sidecar_identity_info{source,facts}`
+  - SID-07 (FDD 27), contrato 9: campos `gomaxprocs`, `gomemlimit_bytes` e `cgocheck_off` no `adapter_loaded`; gauges `n3x_sidecar_go_maxprocs`, `n3x_sidecar_go_memory_limit_bytes` e `n3x_sidecar_go_memory_bytes`
+  - SID-08 (FDD 28), seção 7: gauge `n3x_sidecar_image_info{version,target}` (hipótese)
+  - SID-09 (FDD 29), contrato 6: o adaptador chama `drain.Server.Serve(p.Stop)` depois do `Chain.Start` e `Close()` no fim do `Process.Stop`; o `Stop` pedido pelo canal de controle roda fora da thread principal
+  - SID-10 (FDD 38), contrato 11: handles `SetBufferBytes`, `ConnectFailure`, `ControllerBuffer` e `AddControllerStreams`, com as séries `n3x_controller_buffer_bytes`, `n3x_controller_connect_failures_total{reason}`, `n3x_plugin_controller_buffer_total{plugin,result}` e `n3x_plugin_controller_streams{plugin}`; no standalone, as séries de conexão e de buffer não são definidas
+  - SID-11 (FDD 49), contratos 6 e 7 e seção 7: `adapter.Mesh`, `Host.Mesh()`, `Host.Reserved()`, `ProcessOptions{KeepOnLastRelease}` com `NewProcessWith`, código comum em `core/adapter/internal/dynmod`, `reason` `drain_scheduled` em `runtime_stopping`, eventos `filter_config_released` e `filter_config_reattached` e as métricas `n3x_sidecar_istio_info`, `n3x_sidecar_filter_config_refs`, `n3x_sidecar_filter_config_events_total`, `n3x_sidecar_drain_signals_total` e `n3x_sidecar_path_rejected_total`
+  - SID-12 (FDD 50), seção 7: counters `n3x_sidecar_go_gc_cpu_seconds_total`, `n3x_sidecar_go_gc_cycles_total`, `n3x_sidecar_go_alloc_objects_total` e `n3x_sidecar_go_alloc_bytes_total` (fonte em `runtime/metrics`, com a SID-07)
+- Meta de cruzamentos (I-01): a redefinição "até 5 entradas com trabalho de cadeia por requisição" foi aprovada e aplicada ao PRD, ao HLD e ao ADR-009 na validação de consistência
+- Admin do Envoy em socket Unix (L-16) e campo `instance` dos logs como instância do plugin, com a identidade do sidecar vinda do coletor do orquestrador (I-03): aprovados e refletidos no PRD na validação de consistência
+
 ---
 
 ### 2. Objetivos técnicos

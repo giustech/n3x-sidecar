@@ -24,3 +24,9 @@ O FR-004 pede que panics repetidos desliguem o plugin até o próximo restart, s
 
 ## Requisitos relacionados
 FR-004, FR-016; confiabilidade nos requisitos não funcionais.
+
+## Nota de revisão (2026-10-22)
+- Panic em fail-closed responde 503 (`UNAVAILABLE` em gRPC); o 500 (`INTERNAL`) fica para falha do próprio N3X (L-71, SID-04)
+- Eventos: `breaker_open` sai por instância, quando o disjuntor dela abre, com o motivo (`panics` ou `zombies`); `plugin_disabled` sai uma vez por plugin, quando todas as instâncias com fase daquele plugin estão abertas, e é o "desligamento automático" do FR-004 e do painel (L-70, SID-04)
+- Instância com o disjuntor aberto não recebe nenhum hook da requisição, nem o `OnComplete` (SID-03 e SID-04)
+- O PRD (FR-004) foi atualizado para o disjuntor por instância, por panics e por zumbis

@@ -63,6 +63,13 @@ Quem consome:
   - FDD 25: `preflight.Run` uma vez, saída por `preflight.ExitCode(err)`, `Durations` no resumo da subida, `res.Config` para as FDDs 26 e 29, arquivo de fatos gravado entre os passos 8 e 9 (falha de escrita sai com 6, `reason` `write`); dona da saída 7 (contratos 1 e 6)
   - FDD 26: Envoy com ambiente montado do zero (search path, sem o marcador), `--disable-hot-restart`, `--log-level` com `warn` virando `warning`, sem `--log-format`; base de ambiente para o `--mode validate`; "Envoy pronto" por `GET /ready` no socket; código de saída 7 (contratos 4 e 5)
 
+**Clarificações (2026-10-22)**
+- Refinos pedidos por FDDs posteriores (validação de consistência de 2026-10-22): o texto desta FDD continua valendo com os acréscimos e mudanças abaixo; em conflito, vale o contrato da FDD citada em cada item
+  - SID-08 (FDD 28), contrato 8: passo 0 do `supervisor.Run`: `imagecheck.Check(ModeStandard)` logo depois de registrar os sinais e antes do `preflight.Run`; UID efetivo 0 sai com 8 (`N3X-S008`, `run_as_root`)
+  - SID-09 (FDD 29), contrato 4: argumento `--drain-strategy immediate` no processo do Envoy, junto com o `--drain-time-s`
+  - SID-12 (FDD 50), seção 7: as métricas de GC e de alocação (`n3x_sidecar_go_gc_*` e `n3x_sidecar_go_alloc_*`, de `runtime/metrics`) entram junto com as gauges `n3x_sidecar_go_*` do contrato 9, publicadas pela SID-02
+- CPU sem limite (I-03) e repasse do código de saída do Envoy (I-02): aplicados ao PRD (exemplo do FR-001), ao HLD e ao ADR-008 na validação de consistência
+
 ---
 
 ### 2. Objetivos técnicos

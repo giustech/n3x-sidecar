@@ -22,3 +22,6 @@ A config dos plugins precisa chegar do `n3x.yaml` ao `.so`. Embutir a config dec
 
 ## Requisitos relacionados
 FR-001, FR-004; segurança nos requisitos não funcionais.
+
+## Nota de revisão (2026-10-22)
+- A config do filtro passou a ter só `config_path`. O `key_path` foi retirado, e a única fonte do caminho da chave é `keys.aes_file` do `n3x.yaml`, lido pelo `.so` (SID-01 e SID-06). O filtro usa `do_not_close: true`, porque o runtime Go não pode ser descarregado (SID-06)

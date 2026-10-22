@@ -25,3 +25,8 @@ Uso típico: `docker run --rm -i -v $PWD/aes.key:/k n3x/sidecar:<versão>-<alvo>
 
 ## Requisitos relacionados
 FR-001; segurança nos requisitos não funcionais.
+
+## Nota de revisão (2026-10-22)
+- `n3x encrypt --key <arquivo> --service <serviço>`: o `--service` é obrigatório, porque o serviço entra no dado associado `n3x:v1:<serviço>` do `ENC[...]` (SID-01). O uso típico passa a ser `docker run --rm -i -v $PWD/aes.key:/k n3x/sidecar:<versão>-<alvo> encrypt --key /k --service <serviço>`
+- Subcomandos acrescentados por adição: `help` (SID-01); `probe live|ready`, para o health check por comando no ECS e no docker compose (SID-09); e, na imagem `istio-*`, `istio-drain` para o preStop, a palavra `proxy`, que entra no modo Istio, e o repasse dos demais subcomandos do `pilot-agent` (SID-11). O `validate` ganhou `--mode istio|default` (SID-11)
+- A imagem usa `ENTRYPOINT ["/usr/local/bin/n3x"]` com `CMD ["run"]`, para os subcomandos funcionarem pelo `docker run` (SID-08)

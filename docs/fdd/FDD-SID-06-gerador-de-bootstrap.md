@@ -68,6 +68,12 @@ Consumidores:
   - **P-11 da FDD 06 (parte desta FDD):** destinos reservados do `env.Dial` (contrato 3)
   - **L-45 (fato registrado para as FDDs 16 e 38):** o bootstrap tem exatamente uma ocorrência do filtro `n3x`, então, no modo padrão, a config do filtro é criada uma vez por processo do Envoy
 
+**Clarificações (2026-10-22)**
+- Refinos pedidos por FDDs posteriores (validação de consistência de 2026-10-22): o texto desta FDD continua valendo com os acréscimos e mudanças abaixo; em conflito, vale o contrato da FDD citada em cada item
+  - SID-09 (FDD 29), contratos 1 e 9: `envoycfg.ReservedLoopbackPorts` passa a `{17001, 17021, 17090}`; o listener `n3x_ingress` ganha `traffic_direction: INBOUND` (o `n3x_metrics` fica sem valor), para o `drain_listeners?inboundonly` drenar só a entrada
+  - SID-11 (FDD 49), contrato 6: arquivo novo `core/envoycfg/istio.go` com `IstioReservedLoopbackPorts` e `IstioReservedUnixDirs` (dono: SID-11)
+- Admin em socket Unix (L-16), retirada do `key_path` (I-02), protocolo do upstream por `typed_extension_protocol_options` (I-04) e prazo de gRPC pelo `grpc-timeout` do cliente (I-03): aprovados e aplicados ao PRD, ao HLD e aos ADR-006 e ADR-007 na validação de consistência
+
 ---
 
 ### 2. Objetivos técnicos

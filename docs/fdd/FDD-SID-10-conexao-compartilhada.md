@@ -67,6 +67,12 @@ Esta entrevista achou três problemas novos:
   - FDD 36: exceção de prazo da L-08 pelo método completo `/n3x.plugins.n3x.core.v1.Login/Login` e `Core/Heartbeat` como o stream sem teto (contrato 4)
   - FDD 17 (P-04 dela): implementação das portas `ControllerProvider` (com `Install`) e `SidecarParts.ExitContext` na forma do contrato 9 dela, com um único acréscimo, `Configure`, porque o provedor nasce na carga do `.so`, antes de o `n3x.yaml` ser lido (contrato 2)
 
+**Clarificações (2026-10-22)**
+- Refinos pedidos por FDDs posteriores (validação de consistência de 2026-10-22): o texto desta FDD continua valendo com os acréscimos e mudanças abaixo; em conflito, vale o contrato da FDD citada em cada item
+  - SID-05 (FDD 25), contrato 8: a forma de `SidecarParts.Identity` citada no contrato 2 desta FDD foi refinada para `func(cfg *config.Config) (proxy.SidecarIdentity, error)`
+- Volta ao painel (I-01): o critério de 30 s vale depois de um restart ou de uma queda de até cerca de 20 s, e o de 73 s depois de queda longa; o teto de backoff de 60 s fica até a medida do simulador de 500 sidecars (FDD 51). Aplicado ao PRD na validação de consistência
+- Teto das chamadas ao controller (L-08): registrado no HLD e no ADR-006 na validação de consistência
+
 ---
 
 ### 2. Objetivos técnicos
